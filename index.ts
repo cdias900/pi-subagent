@@ -40,6 +40,64 @@ import {
 } from "./team.js";
 
 /**
+ * Discover all extension entry points in the agent directory.
+ * Checks: global extensions dir, and all installed git packages for index.ts files.
+ * Excludes the subagent extension itself to avoid recursion.
+ */
+function discoverExtensionPaths(agentDir: string): string[] {
+	const extensions: string[] = [];
+	const thisExtDir = path.resolve(__dirname);
+
+	// 1. Global extensions: ~/.pi/agent*/extensions/*.ts and ~/.pi/agent*/extensions/*/index.ts
+	const globalExtDir = path.join(agentDir, "extensions");
+	if (fs.existsSync(globalExtDir)) {
+		for (const entry of fs.readdirSync(globalExtDir, { withFileTypes: true })) {
+			if (entry.isFile() && entry.name.endsWith(".ts")) {
+				extensions.push(path.join(globalExtDir, entry.name));
+			} else if (entry.isDirectory()) {
+				const idx = path.join(globalExtDir, entry.name, "index.ts");
+				if (fs.existsSync(idx)) {
+					const resolved = path.resolve(path.dirname(idx));
+					if (resolved !== thisExtDir) extensions.push(idx);
+				}
+			}
+		}
+	}
+
+	// 2. Installed git packages: ~/.pi/agent*/git/github.com/*/*/index.ts
+	const gitDir = path.join(agentDir, "git", "github.com");
+	if (fs.existsSync(gitDir)) {
+		for (const user of fs.readdirSync(gitDir, { withFileTypes: true })) {
+			if (!user.isDirectory()) continue;
+			const userDir = path.join(gitDir, user.name);
+			for (const repo of fs.readdirSync(userDir, { withFileTypes: true })) {
+				if (!repo.isDirectory()) continue;
+				const idx = path.join(userDir, repo.name, "index.ts");
+				if (fs.existsSync(idx)) {
+					const resolved = path.resolve(path.dirname(idx));
+					if (resolved !== thisExtDir) extensions.push(idx);
+				}
+				// Also check extensions subdirectories within packages
+				const pkgExtDir = path.join(userDir, repo.name, "extensions");
+				if (fs.existsSync(pkgExtDir)) {
+					for (const ext of fs.readdirSync(pkgExtDir, { withFileTypes: true })) {
+						if (ext.isDirectory()) {
+							const extIdx = path.join(pkgExtDir, ext.name, "index.ts");
+							if (fs.existsSync(extIdx)) {
+								const resolved = path.resolve(path.dirname(extIdx));
+								if (resolved !== thisExtDir) extensions.push(extIdx);
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
+	return extensions;
+}
+
+/**
  * Find the mcp-bridge extension's index.ts — checks installed packages (git/) and extensions dir.
  */
 function findMcpBridgePath(agentDir: string): string | null {
@@ -296,6 +354,13 @@ async function runSingleAgent(
 
 	const args: string[] = ["--mode", "json", "-p", "--no-session", "--no-extensions"];
 
+	// Forward all parent extensions to subagents so they have access to extension-registered tools
+	const agentDir = getAgentDir();
+	const extensionPaths = discoverExtensionPaths(agentDir);
+	for (const extPath of extensionPaths) {
+		args.push("-e", extPath);
+	}
+
 	// If MCPs are requested, write a scoped config and load only the mcp-bridge extension
 	let mcpConfigPath: string | null = null;
 	let mcpCleanupName: string | null = null;
@@ -304,9 +369,7 @@ async function runSingleAgent(
 		mcpConfigPath = writeScopedMcpConfig(teamName, saveAs, mcps);
 		mcpCleanupName = saveAs;
 		if (mcpConfigPath) {
-			// Find the mcp-bridge extension to load explicitly
-			// Find the mcp-bridge extension — check installed packages first, then extensions dir
-			const agentDir = getAgentDir();
+			// Find the mcp-bridge extension to load explicitly (may already be in extensionPaths, but -e dedupes)
 			const bridgePath = findMcpBridgePath(agentDir);
 			if (bridgePath) {
 				args.push("-e", bridgePath);
