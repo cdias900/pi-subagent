@@ -40,31 +40,30 @@ import {
 } from "./team.js";
 
 /**
- * Discover all extension entry points in the agent directory.
- * Checks: global extensions dir, and all installed git packages for index.ts files.
- * Excludes the subagent extension itself to avoid recursion.
+ * Build a map of extension name -> file path by scanning the agent directory.
+ * Checks: global extensions dir, and extensions subdirectories within installed git packages.
+ * Extension names are derived from directory names or filenames (without .ts).
  */
-function discoverExtensionPaths(agentDir: string): string[] {
-	const extensions: string[] = [];
-	const thisExtDir = path.resolve(__dirname);
+function buildExtensionMap(agentDir: string): Map<string, string> {
+	const extMap = new Map<string, string>();
 
 	// 1. Global extensions: ~/.pi/agent*/extensions/*.ts and ~/.pi/agent*/extensions/*/index.ts
 	const globalExtDir = path.join(agentDir, "extensions");
 	if (fs.existsSync(globalExtDir)) {
 		for (const entry of fs.readdirSync(globalExtDir, { withFileTypes: true })) {
 			if (entry.isFile() && entry.name.endsWith(".ts")) {
-				extensions.push(path.join(globalExtDir, entry.name));
+				const name = entry.name.replace(/\.ts$/, "");
+				extMap.set(name, path.join(globalExtDir, entry.name));
 			} else if (entry.isDirectory()) {
 				const idx = path.join(globalExtDir, entry.name, "index.ts");
 				if (fs.existsSync(idx)) {
-					const resolved = path.resolve(path.dirname(idx));
-					if (resolved !== thisExtDir) extensions.push(idx);
+					extMap.set(entry.name, idx);
 				}
 			}
 		}
 	}
 
-	// 2. Installed git packages: ~/.pi/agent*/git/github.com/*/*/index.ts
+	// 2. Installed git packages — scan extensions/ subdirectories
 	const gitDir = path.join(agentDir, "git", "github.com");
 	if (fs.existsSync(gitDir)) {
 		for (const user of fs.readdirSync(gitDir, { withFileTypes: true })) {
@@ -72,20 +71,13 @@ function discoverExtensionPaths(agentDir: string): string[] {
 			const userDir = path.join(gitDir, user.name);
 			for (const repo of fs.readdirSync(userDir, { withFileTypes: true })) {
 				if (!repo.isDirectory()) continue;
-				const idx = path.join(userDir, repo.name, "index.ts");
-				if (fs.existsSync(idx)) {
-					const resolved = path.resolve(path.dirname(idx));
-					if (resolved !== thisExtDir) extensions.push(idx);
-				}
-				// Also check extensions subdirectories within packages
 				const pkgExtDir = path.join(userDir, repo.name, "extensions");
 				if (fs.existsSync(pkgExtDir)) {
 					for (const ext of fs.readdirSync(pkgExtDir, { withFileTypes: true })) {
 						if (ext.isDirectory()) {
 							const extIdx = path.join(pkgExtDir, ext.name, "index.ts");
 							if (fs.existsSync(extIdx)) {
-								const resolved = path.resolve(path.dirname(extIdx));
-								if (resolved !== thisExtDir) extensions.push(extIdx);
+								extMap.set(ext.name, extIdx);
 							}
 						}
 					}
@@ -94,7 +86,21 @@ function discoverExtensionPaths(agentDir: string): string[] {
 		}
 	}
 
-	return extensions;
+	return extMap;
+}
+
+/**
+ * Resolve requested extension names to file paths.
+ * Returns only the paths for extensions that exist and were requested.
+ */
+function resolveExtensionPaths(agentDir: string, requested: string[]): string[] {
+	const extMap = buildExtensionMap(agentDir);
+	const resolved: string[] = [];
+	for (const name of requested) {
+		const extPath = extMap.get(name);
+		if (extPath) resolved.push(extPath);
+	}
+	return resolved;
 }
 
 /**
@@ -334,6 +340,7 @@ async function runSingleAgent(
 	onUpdate: OnUpdateCallback | undefined,
 	makeDetails: (results: SingleResult[]) => SubagentDetails,
 	mcps?: string[],
+	runtimeExtensions?: string[],
 	teamName?: string,
 ): Promise<SingleResult> {
 	const agent = agents.find((a) => a.name === agentName);
@@ -354,11 +361,17 @@ async function runSingleAgent(
 
 	const args: string[] = ["--mode", "json", "-p", "--no-session", "--no-extensions"];
 
-	// Forward all parent extensions to subagents so they have access to extension-registered tools
+	// Merge extensions from agent frontmatter and runtime (orchestrator) request, deduplicate
 	const agentDir = getAgentDir();
-	const extensionPaths = discoverExtensionPaths(agentDir);
-	for (const extPath of extensionPaths) {
-		args.push("-e", extPath);
+	const allExtensions = new Set<string>([
+		...(agent.extensions || []),
+		...(runtimeExtensions || []),
+	]);
+	if (allExtensions.size > 0) {
+		const extensionPaths = resolveExtensionPaths(agentDir, [...allExtensions]);
+		for (const extPath of extensionPaths) {
+			args.push("-e", extPath);
+		}
 	}
 
 	// If MCPs are requested, write a scoped config and load only the mcp-bridge extension
@@ -369,7 +382,6 @@ async function runSingleAgent(
 		mcpConfigPath = writeScopedMcpConfig(teamName, saveAs, mcps);
 		mcpCleanupName = saveAs;
 		if (mcpConfigPath) {
-			// Find the mcp-bridge extension to load explicitly (may already be in extensionPaths, but -e dedupes)
 			const bridgePath = findMcpBridgePath(agentDir);
 			if (bridgePath) {
 				args.push("-e", bridgePath);
@@ -539,6 +551,13 @@ const TaskItem = Type.Object({
 				"Only these MCPs are loaded. Omit for no MCPs (fastest). Requires team mode.",
 		}),
 	),
+	extensions: Type.Optional(
+		Type.Array(Type.String(), {
+			description:
+				"Extension names this agent needs (e.g. [\"slack\", \"observe\"]). " +
+				"Only these extensions are loaded. Merged with agent's frontmatter extensions. Omit for none.",
+		}),
+	),
 });
 
 const ChainItem = Type.Object({
@@ -553,6 +572,13 @@ const ChainItem = Type.Object({
 			description:
 				"MCP server names this agent needs (e.g. [\"grokt-mcp\", \"dev-mcp\"]). " +
 				"Only these MCPs are loaded. Omit for no MCPs (fastest). Requires team mode.",
+		}),
+	),
+	extensions: Type.Optional(
+		Type.Array(Type.String(), {
+			description:
+				"Extension names this agent needs (e.g. [\"slack\", \"observe\"]). " +
+				"Only these extensions are loaded. Merged with agent's frontmatter extensions. Omit for none.",
 		}),
 	),
 });
@@ -692,7 +718,7 @@ export default function (pi: ExtensionAPI) {
 
 					const result = await runSingleAgent(
 						ctx.cwd, agents, step.agent, taskWithContext, step.cwd, i + 1, signal, chainUpdate, makeDetails("chain"),
-						step.mcps, teamName,
+						step.mcps, step.extensions, teamName,
 					);
 					results.push(result);
 
@@ -777,7 +803,7 @@ export default function (pi: ExtensionAPI) {
 							}
 						},
 						makeDetails("parallel"),
-						t.mcps, teamName,
+						t.mcps, t.extensions, teamName,
 					);
 
 					// Team mode: save named output
@@ -818,7 +844,7 @@ export default function (pi: ExtensionAPI) {
 
 				const result = await runSingleAgent(
 					ctx.cwd, agents, params.agent, taskText, params.cwd, undefined, signal, onUpdate, makeDetails("single"),
-					undefined, teamName,
+					undefined, undefined, teamName,
 				);
 
 				// Team mode: save named output
