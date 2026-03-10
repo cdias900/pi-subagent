@@ -608,6 +608,20 @@ const SubagentParams = Type.Object({
 	saveAs: Type.Optional(
 		Type.String({ description: "Name for saved output in team mode (single mode only, default: agent name)" }),
 	),
+	mcps: Type.Optional(
+		Type.Array(Type.String(), {
+			description:
+				"MCP server names this agent needs (e.g. [\"grokt-mcp\", \"dev-mcp\"]). " +
+				"Only these MCPs are loaded. Omit for no MCPs (fastest). Requires team mode.",
+		}),
+	),
+	extensions: Type.Optional(
+		Type.Array(Type.String(), {
+			description:
+				"Extension names this agent needs (e.g. [\"slack\", \"observe\"]). " +
+				"Only these extensions are loaded. Merged with agent's frontmatter extensions. Omit for none.",
+		}),
+	),
 });
 
 export default function (pi: ExtensionAPI) {
@@ -844,7 +858,7 @@ export default function (pi: ExtensionAPI) {
 
 				const result = await runSingleAgent(
 					ctx.cwd, agents, params.agent, taskText, params.cwd, undefined, signal, onUpdate, makeDetails("single"),
-					undefined, undefined, teamName,
+					params.mcps, params.extensions, teamName,
 				);
 
 				// Team mode: save named output
