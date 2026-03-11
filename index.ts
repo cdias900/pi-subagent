@@ -145,6 +145,72 @@ function formatTokens(count: number): string {
 	return `${(count / 1000000).toFixed(1)}M`;
 }
 
+function formatDuration(ms: number): string {
+	const totalSec = Math.floor(ms / 1000);
+	const h = Math.floor(totalSec / 3600);
+	const m = Math.floor((totalSec % 3600) / 60);
+	const s = totalSec % 60;
+	if (h > 0) return `${h}h ${m}m ${s}s`;
+	if (m > 0) return `${m}m ${s}s`;
+	return `${s}s`;
+}
+
+/**
+ * Parse a model string like "openai/gpt-5.4:xhigh" or "anthropic-1m/claude-opus-4-6:high"
+ * into { provider, model, reasoning }.
+ */
+function parseModelString(modelStr: string): { provider: string; model: string; reasoning: string } {
+	let provider = "—";
+	let model = modelStr;
+	let reasoning = "off";
+
+	// Extract reasoning level from suffix ":level"
+	const colonIdx = model.lastIndexOf(":");
+	if (colonIdx > 0) {
+		const suffix = model.slice(colonIdx + 1);
+		if (["minimal", "low", "medium", "high", "xhigh"].includes(suffix)) {
+			reasoning = suffix;
+			model = model.slice(0, colonIdx);
+		}
+	}
+
+	// Extract provider from prefix "provider/"
+	const slashIdx = model.indexOf("/");
+	if (slashIdx > 0) {
+		provider = model.slice(0, slashIdx);
+		model = model.slice(slashIdx + 1);
+	}
+
+	return { provider, model, reasoning };
+}
+
+/** Known context window sizes (tokens) for common models. */
+const KNOWN_CONTEXT_WINDOWS: Record<string, number> = {
+	"claude-sonnet-4-20250514": 200000,
+	"claude-haiku-4-5-20250414": 200000,
+	"claude-opus-4-20250514": 200000,
+	"claude-opus-4-6": 1000000,
+	"gpt-5.4": 200000,
+	"gpt-5.4-mini": 200000,
+	"gpt-4.1": 1047576,
+	"gpt-4.1-mini": 1047576,
+	"gpt-4.1-nano": 1047576,
+	"o3": 200000,
+	"o4-mini": 200000,
+	"gemini-2.5-pro": 1048576,
+	"gemini-2.5-flash": 1048576,
+};
+
+function getContextWindow(model: string): number | null {
+	// Try exact match first
+	if (KNOWN_CONTEXT_WINDOWS[model]) return KNOWN_CONTEXT_WINDOWS[model];
+	// Try prefix match (e.g. "claude-sonnet-4" matches "claude-sonnet-4-20250514")
+	for (const [key, value] of Object.entries(KNOWN_CONTEXT_WINDOWS)) {
+		if (key.startsWith(model) || model.startsWith(key)) return value;
+	}
+	return null;
+}
+
 function formatUsageStats(
 	usage: {
 		input: number;
@@ -156,19 +222,55 @@ function formatUsageStats(
 		turns?: number;
 	},
 	model?: string,
+	opts?: {
+		provider?: string;
+		elapsedMs?: number;
+	},
 ): string {
-	const parts: string[] = [];
-	if (usage.turns) parts.push(`${usage.turns} turn${usage.turns > 1 ? "s" : ""}`);
-	if (usage.input) parts.push(`↑${formatTokens(usage.input)}`);
-	if (usage.output) parts.push(`↓${formatTokens(usage.output)}`);
-	if (usage.cacheRead) parts.push(`R${formatTokens(usage.cacheRead)}`);
-	if (usage.cacheWrite) parts.push(`W${formatTokens(usage.cacheWrite)}`);
-	if (usage.cost) parts.push(`$${usage.cost.toFixed(4)}`);
-	if (usage.contextTokens && usage.contextTokens > 0) {
-		parts.push(`ctx:${formatTokens(usage.contextTokens)}`);
+	const sep = " │ ";
+	const hasSingleAgentData = !!model;
+
+	if (hasSingleAgentData) {
+		// Two-line format for single agent results
+		// Line 1: tokens │ cost │ context %
+		const line1Parts: string[] = [];
+		const totalTokens = (usage.input || 0) + (usage.output || 0);
+		if (totalTokens > 0) line1Parts.push(`${formatTokens(totalTokens)} tokens`);
+		if (usage.cost) line1Parts.push(`$${usage.cost.toFixed(3)}`);
+		if (usage.contextTokens && usage.contextTokens > 0) {
+			const parsed = parseModelString(model);
+			const ctxWindow = getContextWindow(parsed.model);
+			if (ctxWindow) {
+				const pct = ((usage.contextTokens / ctxWindow) * 100).toFixed(1);
+				line1Parts.push(`${pct}% (${formatTokens(usage.contextTokens)}/${formatTokens(ctxWindow)})`);
+			} else {
+				line1Parts.push(`ctx:${formatTokens(usage.contextTokens)}`);
+			}
+		}
+
+		// Line 2: turns │ provider ● model ● reasoning │ elapsed
+		const line2Parts: string[] = [];
+		if (usage.turns) line2Parts.push(`${usage.turns} turn${usage.turns > 1 ? "s" : ""}`);
+		const parsed = parseModelString(model);
+		const provider = opts?.provider || parsed.provider;
+		line2Parts.push(`${provider} ● ${parsed.model} ● ${parsed.reasoning}`);
+		if (opts?.elapsedMs && opts.elapsedMs > 0) {
+			line2Parts.push(formatDuration(opts.elapsedMs));
+		}
+
+		return [line1Parts.join(sep), line2Parts.join(sep)].filter(Boolean).join("\n");
 	}
-	if (model) parts.push(model);
-	return parts.join(" ");
+
+	// Single-line format for aggregate totals (no model/provider data)
+	const parts: string[] = [];
+	if (usage.turns) parts.push(`${usage.turns} turns`);
+	const totalTokens = (usage.input || 0) + (usage.output || 0);
+	if (totalTokens > 0) parts.push(`${formatTokens(totalTokens)} tokens`);
+	if (usage.cost) parts.push(`$${usage.cost.toFixed(3)}`);
+	if (opts?.elapsedMs && opts.elapsedMs > 0) {
+		parts.push(formatDuration(opts.elapsedMs));
+	}
+	return parts.join(sep);
 }
 
 function formatToolCall(
@@ -258,10 +360,12 @@ interface SingleResult {
 	stderr: string;
 	usage: UsageStats;
 	model?: string;
+	provider?: string;
 	stopReason?: string;
 	errorMessage?: string;
 	step?: number;
 	savedAs?: string;
+	startTime: number;
 }
 
 interface SubagentDetails {
@@ -356,6 +460,7 @@ async function runSingleAgent(
 			stderr: `Unknown agent: "${agentName}". Available agents: ${available}.`,
 			usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
 			step,
+			startTime: Date.now(),
 		};
 	}
 
@@ -405,6 +510,7 @@ async function runSingleAgent(
 		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
 		model: agent.model,
 		step,
+		startTime: Date.now(),
 	};
 
 	const emitUpdate = () => {
@@ -466,6 +572,7 @@ async function runSingleAgent(
 							currentResult.usage.contextTokens = usage.totalTokens || 0;
 						}
 						if (!currentResult.model && msg.model) currentResult.model = msg.model;
+						if (!currentResult.provider && (msg as any).provider) currentResult.provider = (msg as any).provider;
 						if (msg.stopReason) currentResult.stopReason = msg.stopReason;
 						if (msg.errorMessage) currentResult.errorMessage = msg.errorMessage;
 					}
@@ -787,6 +894,7 @@ export default function (pi: ExtensionAPI) {
 						messages: [],
 						stderr: "",
 						usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
+						startTime: Date.now(),
 					};
 				}
 
@@ -1002,7 +1110,10 @@ export default function (pi: ExtensionAPI) {
 							container.addChild(new Markdown(finalOutput.trim(), 0, 0, mdTheme));
 						}
 					}
-					const usageStr = formatUsageStats(r.usage, r.model);
+					const usageStr = formatUsageStats(r.usage, r.model, {
+						provider: r.provider,
+						elapsedMs: Date.now() - r.startTime,
+					});
 					if (usageStr) {
 						container.addChild(new Spacer(1));
 						container.addChild(new Text(theme.fg("dim", usageStr), 0, 0));
@@ -1020,7 +1131,10 @@ export default function (pi: ExtensionAPI) {
 					text += `\n${renderDisplayItems(displayItems, COLLAPSED_ITEM_COUNT)}`;
 					if (displayItems.length > COLLAPSED_ITEM_COUNT) text += `\n${theme.fg("muted", "(Ctrl+O to expand)")}`;
 				}
-				const usageStr = formatUsageStats(r.usage, r.model);
+				const usageStr = formatUsageStats(r.usage, r.model, {
+					provider: r.provider,
+					elapsedMs: Date.now() - r.startTime,
+				});
 				if (usageStr) text += `\n${theme.fg("dim", usageStr)}`;
 				return new Text(text, 0, 0);
 			}
@@ -1036,6 +1150,11 @@ export default function (pi: ExtensionAPI) {
 					total.turns += r.usage.turns;
 				}
 				return total;
+			};
+
+			const aggregateElapsedMs = (results: SingleResult[]) => {
+				const earliest = Math.min(...results.map((r) => r.startTime));
+				return Date.now() - earliest;
 			};
 
 			if (details.mode === "chain") {
@@ -1089,11 +1208,16 @@ export default function (pi: ExtensionAPI) {
 							container.addChild(new Markdown(finalOutput.trim(), 0, 0, mdTheme));
 						}
 
-						const stepUsage = formatUsageStats(r.usage, r.model);
+						const stepUsage = formatUsageStats(r.usage, r.model, {
+							provider: r.provider,
+							elapsedMs: Date.now() - r.startTime,
+						});
 						if (stepUsage) container.addChild(new Text(theme.fg("dim", stepUsage), 0, 0));
 					}
 
-					const usageStr = formatUsageStats(aggregateUsage(details.results));
+					const usageStr = formatUsageStats(aggregateUsage(details.results), undefined, {
+						elapsedMs: aggregateElapsedMs(details.results),
+					});
 					if (usageStr) {
 						container.addChild(new Spacer(1));
 						container.addChild(new Text(theme.fg("dim", `Total: ${usageStr}`), 0, 0));
@@ -1114,7 +1238,9 @@ export default function (pi: ExtensionAPI) {
 					if (displayItems.length === 0) text += `\n${theme.fg("muted", "(no output)")}`;
 					else text += `\n${renderDisplayItems(displayItems, 5)}`;
 				}
-				const usageStr = formatUsageStats(aggregateUsage(details.results));
+				const usageStr = formatUsageStats(aggregateUsage(details.results), undefined, {
+					elapsedMs: aggregateElapsedMs(details.results),
+				});
 				if (usageStr) text += `\n\n${theme.fg("dim", `Total: ${usageStr}`)}`;
 				text += `\n${theme.fg("muted", "(Ctrl+O to expand)")}`;
 				return new Text(text, 0, 0);
@@ -1174,11 +1300,16 @@ export default function (pi: ExtensionAPI) {
 							container.addChild(new Markdown(finalOutput.trim(), 0, 0, mdTheme));
 						}
 
-						const taskUsage = formatUsageStats(r.usage, r.model);
+						const taskUsage = formatUsageStats(r.usage, r.model, {
+							provider: r.provider,
+							elapsedMs: Date.now() - r.startTime,
+						});
 						if (taskUsage) container.addChild(new Text(theme.fg("dim", taskUsage), 0, 0));
 					}
 
-					const usageStr = formatUsageStats(aggregateUsage(details.results));
+					const usageStr = formatUsageStats(aggregateUsage(details.results), undefined, {
+						elapsedMs: aggregateElapsedMs(details.results),
+					});
 					if (usageStr) {
 						container.addChild(new Spacer(1));
 						container.addChild(new Text(theme.fg("dim", `Total: ${usageStr}`), 0, 0));
@@ -1202,7 +1333,9 @@ export default function (pi: ExtensionAPI) {
 					else text += `\n${renderDisplayItems(displayItems, 5)}`;
 				}
 				if (!isRunning) {
-					const usageStr = formatUsageStats(aggregateUsage(details.results));
+					const usageStr = formatUsageStats(aggregateUsage(details.results), undefined, {
+						elapsedMs: aggregateElapsedMs(details.results),
+					});
 					if (usageStr) text += `\n\n${theme.fg("dim", `Total: ${usageStr}`)}`;
 				}
 				if (!expanded) text += `\n${theme.fg("muted", "(Ctrl+O to expand)")}`;
