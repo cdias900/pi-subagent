@@ -16,6 +16,7 @@ import { type ChildProcess, spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { fileURLToPath } from "node:url";
 import type { AgentToolResult } from "@mariozechner/pi-agent-core";
 import type { Message } from "@mariozechner/pi-ai";
 import { StringEnum } from "@mariozechner/pi-ai";
@@ -404,6 +405,41 @@ const backgroundAgents = new Map<string, BackgroundAgent>();
 const bgAutoCounter = new Map<string, number>();
 let piRef: ExtensionAPI | null = null;
 
+// UI context captured on session_start — used for belowEditor widget updates
+let uiSetWidget: ((key: string, content: string[] | undefined, options?: { placement?: "aboveEditor" | "belowEditor" }) => void) | null = null;
+
+/** Path to the bg-signal extension that registers __bg_signal as a real tool in child processes */
+const BG_SIGNAL_EXT_PATH = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "bg-signal.ts");
+
+/**
+ * Update the belowEditor widget showing active background agents.
+ * Called after every status transition. Removes widget when no agents are active.
+ */
+function updateBgWidget(): void {
+	if (!uiSetWidget) return;
+
+	const active = [...backgroundAgents.values()].filter(
+		(a) => a.status === "running" || a.status === "queued" || a.status === "waiting",
+	);
+
+	if (active.length === 0) {
+		uiSetWidget("subagent-bg", undefined);
+		return;
+	}
+
+	const lines = active.map((a) => {
+		const elapsed = formatDuration((a.endTime ?? Date.now()) - a.startTime);
+		const icon =
+			a.status === "running" ? "🏃" :
+			a.status === "waiting" ? "⏸️" :
+			"📋";
+		const taskPreview = a.task.length > 50 ? `${a.task.slice(0, 50)}…` : a.task;
+		return `${icon} ${a.id} — ${a.status} ${elapsed}  ${taskPreview}`;
+	});
+
+	uiSetWidget("subagent-bg", [`🤖 Background agents (${active.length})`, ...lines], { placement: "belowEditor" });
+}
+
 function getFinalOutput(messages: Message[]): string {
 	for (let i = messages.length - 1; i >= 0; i--) {
 		const msg = messages[i];
@@ -718,6 +754,9 @@ function buildBgSpawnArgs(
 		}
 	}
 
+	// Always load the bg-signal extension so __bg_signal is a real registered tool
+	args.push("-e", BG_SIGNAL_EXT_PATH);
+
 	if (agentConfig.model) args.push("--model", agentConfig.model);
 	if (agentConfig.tools && agentConfig.tools.length > 0) args.push("--tools", agentConfig.tools.join(","));
 
@@ -764,6 +803,7 @@ function launchBackgroundAgent(bgAgent: BackgroundAgent): void {
 	bgAgent.proc = proc;
 	bgAgent.status = "running";
 	bgAgent.startTime = Date.now();
+	updateBgWidget();
 
 	let buffer = "";
 
@@ -846,6 +886,7 @@ function launchBackgroundAgent(bgAgent: BackgroundAgent): void {
 							}
 						}
 						killBgProcess(bgAgent);
+						updateBgWidget();
 					}
 				}
 
@@ -903,6 +944,7 @@ function launchBackgroundAgent(bgAgent: BackgroundAgent): void {
 		}
 
 		cleanupBgAgent(bgAgent);
+		updateBgWidget();
 		trySpawnQueued();
 	});
 
@@ -921,6 +963,7 @@ function launchBackgroundAgent(bgAgent: BackgroundAgent): void {
 			);
 		}
 		cleanupBgAgent(bgAgent);
+		updateBgWidget();
 		trySpawnQueued();
 	});
 
@@ -962,6 +1005,7 @@ function handleBgSignal(bgAgent: BackgroundAgent, args: Record<string, string>):
 			}
 		}
 		killBgProcess(bgAgent);
+		updateBgWidget();
 	} else if (signalStatus === "question") {
 		bgAgent.status = "waiting";
 		piRef?.sendMessage(
@@ -972,6 +1016,7 @@ function handleBgSignal(bgAgent: BackgroundAgent, args: Record<string, string>):
 			},
 			{ triggerTurn: true },
 		);
+		updateBgWidget();
 		// Process stays alive — waiting for steer
 	} else if (signalStatus === "error") {
 		bgAgent.status = "error";
@@ -985,6 +1030,7 @@ function handleBgSignal(bgAgent: BackgroundAgent, args: Record<string, string>):
 			{ triggerTurn: true },
 		);
 		killBgProcess(bgAgent);
+		updateBgWidget();
 	}
 }
 
@@ -1076,6 +1122,7 @@ function shutdownAllBackgroundAgents(): void {
 		}
 	}
 	backgroundAgents.clear();
+	updateBgWidget();
 }
 
 const TaskItem = Type.Object({
@@ -1178,6 +1225,13 @@ export default function (pi: ExtensionAPI) {
 	piRef = pi;
 	// Register team coordination tools (TeamCreate, TaskCreate, SendMessage, etc.)
 	registerCoordinationTools(pi);
+
+	// Capture UI context for belowEditor widget updates
+	pi.on("session_start", (_event, ctx) => {
+		if (ctx.hasUI) {
+			uiSetWidget = ctx.ui.setWidget.bind(ctx.ui);
+		}
+	});
 
 	pi.registerTool({
 		name: "subagent",
@@ -1485,6 +1539,7 @@ export default function (pi: ExtensionAPI) {
 							},
 							{ triggerTurn: false },
 						);
+						updateBgWidget();
 					}
 
 					return {
@@ -1931,7 +1986,10 @@ export default function (pi: ExtensionAPI) {
 				: JSON.stringify({ type: "steer", message: params.message }) + "\n";
 
 			bgAgent.proc.stdin!.write(steerMsg);
-			if (bgAgent.status === "waiting") bgAgent.status = "running";
+			if (bgAgent.status === "waiting") {
+				bgAgent.status = "running";
+				updateBgWidget();
+			}
 
 			return {
 				content: [
@@ -2082,6 +2140,8 @@ export default function (pi: ExtensionAPI) {
 				},
 				{ triggerTurn: false },
 			);
+
+			updateBgWidget();
 
 			if (wasQueued) {
 				trySpawnQueued();
