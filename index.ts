@@ -405,14 +405,14 @@ const backgroundAgents = new Map<string, BackgroundAgent>();
 const bgAutoCounter = new Map<string, number>();
 let piRef: ExtensionAPI | null = null;
 
-// UI context captured on session_start — used for belowEditor widget updates
-let uiSetWidget: ((key: string, content: string[] | undefined, options?: { placement?: "aboveEditor" | "belowEditor" }) => void) | null = null;
+// UI context captured on session_start — used for widget updates
+let uiSetWidget: ((key: string, content: string[] | undefined) => void) | null = null;
 
 /** Path to the bg-signal extension that registers __bg_signal as a real tool in child processes */
 const BG_SIGNAL_EXT_PATH = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "bg-signal.ts");
 
 /**
- * Update the belowEditor widget showing active background agents.
+ * Update the widget showing active background agents.
  * Called after every status transition. Removes widget when no agents are active.
  */
 function updateBgWidget(): void {
@@ -433,11 +433,10 @@ function updateBgWidget(): void {
 			a.status === "running" ? "🏃" :
 			a.status === "waiting" ? "⏸️" :
 			"📋";
-		const taskPreview = a.task.length > 50 ? `${a.task.slice(0, 50)}…` : a.task;
-		return `${icon} ${a.id} — ${a.status} ${elapsed}  ${taskPreview}`;
+		return `  ${icon} ${a.id} — ${a.status} (${elapsed})`;
 	});
 
-	uiSetWidget("subagent-bg", [`🤖 Background agents (${active.length})`, ...lines], { placement: "belowEditor" });
+	uiSetWidget("subagent-bg", [`🤖 Background agents (${active.length})`, ...lines]);
 }
 
 function getFinalOutput(messages: Message[]): string {
@@ -1226,7 +1225,7 @@ export default function (pi: ExtensionAPI) {
 	// Register team coordination tools (TeamCreate, TaskCreate, SendMessage, etc.)
 	registerCoordinationTools(pi);
 
-	// Capture UI context for belowEditor widget updates
+	// Capture UI context for widget updates
 	pi.on("session_start", (_event, ctx) => {
 		if (ctx.hasUI) {
 			uiSetWidget = ctx.ui.setWidget.bind(ctx.ui);
