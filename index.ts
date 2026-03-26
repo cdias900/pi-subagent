@@ -356,7 +356,7 @@ interface UsageStats {
 
 interface SingleResult {
 	agent: string;
-	agentSource: "user" | "project" | "unknown";
+	agentSource: "user" | "project" | "bundled" | "unknown";
 	task: string;
 	exitCode: number;
 	messages: Message[];
@@ -399,10 +399,38 @@ interface BackgroundAgent {
 	saveAs?: string;
 	extensions?: string[];
 	mcps?: string[];
+	groupId?: string;
 }
 
 const backgroundAgents = new Map<string, BackgroundAgent>();
 const bgAutoCounter = new Map<string, number>();
+
+// ── V2: Background Groups ──────────────────────────────────────────
+interface ChainStepDef {
+	agent: string;
+	task: string;
+	cwd?: string;
+	saveAs?: string;
+	mcps?: string[];
+	extensions?: string[];
+}
+
+interface BackgroundGroup {
+	groupId: string;
+	mode: "parallel" | "chain";
+	memberIds: string[];
+	status: "running" | "done" | "error" | "aborted";
+	startTime: number;
+	endTime?: number;
+	chainSteps?: ChainStepDef[];
+	currentStepIndex?: number;
+	previousOutput?: string;
+	notifyPerTask: boolean;
+	teamName?: string;
+	saveAs?: string;
+}
+
+const backgroundGroups = new Map<string, BackgroundGroup>();
 let piRef: ExtensionAPI | null = null;
 let bgWidgetInterval: ReturnType<typeof setInterval> | null = null;
 
@@ -419,11 +447,13 @@ const BG_SIGNAL_EXT_PATH = path.resolve(path.dirname(fileURLToPath(import.meta.u
 function updateBgWidget(): void {
 	if (!uiSetWidget) return;
 
-	const active = [...backgroundAgents.values()].filter(
-		(a) => a.status === "running" || a.status === "queued" || a.status === "waiting",
+	const activeGroups = [...backgroundGroups.values()].filter((g) => g.status === "running");
+	const activeSolo = [...backgroundAgents.values()].filter(
+		(a) => !a.groupId && (a.status === "running" || a.status === "queued" || a.status === "waiting"),
 	);
+	const totalActive = activeGroups.length + activeSolo.length;
 
-	if (active.length === 0) {
+	if (totalActive === 0) {
 		uiSetWidget("subagent-bg", undefined);
 		if (bgWidgetInterval) {
 			clearInterval(bgWidgetInterval);
@@ -432,21 +462,30 @@ function updateBgWidget(): void {
 		return;
 	}
 
-	// Keep elapsed time ticking while agents are active
 	if (!bgWidgetInterval) {
 		bgWidgetInterval = setInterval(updateBgWidget, 1000);
 	}
 
-	const lines = active.map((a) => {
-		const elapsed = formatDuration((a.endTime ?? Date.now()) - a.startTime);
-		const icon =
-			a.status === "running" ? "🏃" :
-			a.status === "waiting" ? "⏸️" :
-			"📋";
-		return `  ${icon} ${a.id} — ${a.status} (${elapsed})`;
-	});
+	const lines: string[] = [];
 
-	uiSetWidget("subagent-bg", [`🤖 Background agents (${active.length})`, ...lines]);
+	for (const g of activeGroups) {
+		const elapsed = formatDuration((g.endTime ?? Date.now()) - g.startTime);
+		if (g.mode === "parallel") {
+			const members = g.memberIds.map((id) => backgroundAgents.get(id)).filter(Boolean) as BackgroundAgent[];
+			const done = members.filter((m) => m.status === "done" || m.status === "error" || m.status === "aborted").length;
+			lines.push(`  🔀 ${g.groupId} — ${done}/${members.length} done (${elapsed})`);
+		} else {
+			lines.push(`  🔗 ${g.groupId} — step ${(g.currentStepIndex ?? 0) + 1}/${g.chainSteps?.length ?? 0} (${elapsed})`);
+		}
+	}
+
+	for (const a of activeSolo) {
+		const elapsed = formatDuration((a.endTime ?? Date.now()) - a.startTime);
+		const icon = a.status === "running" ? "🏃" : a.status === "waiting" ? "⏸️" : "📋";
+		lines.push(`  ${icon} ${a.id} — ${a.status} (${elapsed})`);
+	}
+
+	uiSetWidget("subagent-bg", [`🤖 Background agents (${totalActive})`, ...lines]);
 }
 
 function getFinalOutput(messages: Message[]): string {
@@ -743,6 +782,32 @@ function generateBgId(agentName: string, explicitId?: string): string {
 	return `${agentName}-${counter}-${Date.now().toString(36).slice(-4)}`;
 }
 
+function generateGroupId(mode: "parallel" | "chain", explicitId?: string): string {
+	if (explicitId && !backgroundGroups.has(explicitId)) return explicitId;
+	const prefix = mode === "parallel" ? "parallel" : "chain";
+	const counter = (bgAutoCounter.get(prefix) || 0) + 1;
+	bgAutoCounter.set(prefix, counter);
+	return `${prefix}-${counter}`;
+}
+
+function generateMemberId(groupId: string, agentName: string, allAgentNames: string[]): string {
+	const dupeCount = allAgentNames.filter((a) => a === agentName).length;
+	if (dupeCount <= 1) return `${groupId}/${agentName}`;
+	const existingMembers = [...backgroundAgents.keys()].filter((id) => id.startsWith(`${groupId}/${agentName}`));
+	return `${groupId}/${agentName}-${existingMembers.length + 1}`;
+}
+
+function resolveId(id: string):
+	| { type: "group"; group: BackgroundGroup }
+	| { type: "agent"; agent: BackgroundAgent }
+	| { type: "not_found" } {
+	const group = backgroundGroups.get(id);
+	if (group) return { type: "group", group };
+	const agent = backgroundAgents.get(id);
+	if (agent) return { type: "agent", agent };
+	return { type: "not_found" };
+}
+
 function buildBgSpawnArgs(
 	agentConfig: AgentConfig,
 	mcps?: string[],
@@ -880,29 +945,10 @@ function launchBackgroundAgent(bgAgent: BackgroundAgent): void {
 					.slice(0, 3);
 				// Idle detection for RPC mode: if turn ended with no __bg_signal and no pending tool calls,
 				// treat as implicit done
-				if (msg.stopReason === "endTurn" && !signalDetected) {
+				if ((msg.stopReason as string) === "endTurn" && !signalDetected) {
 					const hasPendingToolCalls = msg.content.some((p: any) => p.type === "toolCall" && p.name !== "__bg_signal");
 					if (!hasPendingToolCalls && bgAgent.status === "running") {
-						bgAgent.status = "done";
-						bgAgent.endTime = Date.now();
-						const summary = getFinalOutput(bgAgent.result.messages) || "(no output)";
-						piRef?.sendMessage(
-							{
-								customType: "subagent-bg",
-								content: `[✅ DONE from ${bgAgent.id}] ${summary.slice(0, 200)}`,
-								display: true,
-							},
-							{ triggerTurn: true },
-						);
-						if (bgAgent.teamName && bgAgent.saveAs) {
-							const output = getFinalOutput(bgAgent.result.messages);
-							if (output) {
-								saveOutput(bgAgent.teamName, bgAgent.saveAs, output);
-								bgAgent.result.savedAs = bgAgent.saveAs;
-							}
-						}
-						killBgProcess(bgAgent);
-						updateBgWidget();
+						handleBgSignal(bgAgent, { status: "done", summary: getFinalOutput(bgAgent.result.messages) || "(no output)" });
 					}
 				}
 
@@ -935,29 +981,11 @@ function launchBackgroundAgent(bgAgent: BackgroundAgent): void {
 
 		// Only finalize if not already done by __bg_signal
 		if (bgAgent.status === "running" || bgAgent.status === "waiting") {
-			bgAgent.status = code === 0 ? "done" : "error";
-			bgAgent.endTime = Date.now();
-			appendBgUsageEntry(bgAgent, bgAgent.status);
-
 			const summary = getFinalOutput(bgAgent.result.messages) || "(no output)";
-			const icon = bgAgent.status === "done" ? "✅ DONE" : "❌ ERROR";
-			piRef?.sendMessage(
-				{
-					customType: "subagent-bg",
-					content: `[${icon} from ${bgAgent.id}] ${summary.slice(0, 200)}`,
-					display: true,
-				},
-				{ triggerTurn: true },
+			handleBgSignal(
+				bgAgent,
+				code === 0 ? { status: "done", summary } : { status: "error", error: summary },
 			);
-
-			// Save output in team mode
-			if (bgAgent.teamName && bgAgent.saveAs && bgAgent.status === "done") {
-				const output = getFinalOutput(bgAgent.result.messages);
-				if (output) {
-					saveOutput(bgAgent.teamName, bgAgent.saveAs, output);
-					bgAgent.result.savedAs = bgAgent.saveAs;
-				}
-			}
 		}
 
 		cleanupBgAgent(bgAgent);
@@ -968,17 +996,7 @@ function launchBackgroundAgent(bgAgent: BackgroundAgent): void {
 	proc.on("error", () => {
 		bgAgent.result.exitCode = 1;
 		if (bgAgent.status === "running" || bgAgent.status === "waiting") {
-			bgAgent.status = "error";
-			bgAgent.endTime = Date.now();
-			appendBgUsageEntry(bgAgent, bgAgent.status);
-			piRef?.sendMessage(
-				{
-					customType: "subagent-bg",
-					content: `[❌ ERROR from ${bgAgent.id}] Process failed to start`,
-					display: true,
-				},
-				{ triggerTurn: true },
-			);
+			handleBgSignal(bgAgent, { status: "error", error: "Process failed to start" });
 		}
 		cleanupBgAgent(bgAgent);
 		updateBgWidget();
@@ -989,41 +1007,75 @@ function launchBackgroundAgent(bgAgent: BackgroundAgent): void {
 	const prompt = JSON.stringify({ type: "prompt", message: `Task: ${bgAgent.task}` }) + "\n";
 	proc.stdin!.write(prompt);
 
-	piRef?.sendMessage(
-		{
-			customType: "subagent-bg",
-			content: `[🚀 STARTED ${bgAgent.id}] ${bgAgent.agent} — ${bgAgent.task.slice(0, 100)}`,
-			display: true,
-		},
-		{ triggerTurn: false },
-	);
+	if (!bgAgent.groupId) {
+		piRef?.sendMessage(
+			{
+				customType: "subagent-bg",
+				content: `[🚀 STARTED ${bgAgent.id}] ${bgAgent.agent} — ${bgAgent.task.slice(0, 100)}`,
+				display: true,
+			},
+			{ triggerTurn: false },
+		);
+	}
 }
 
 function handleBgSignal(bgAgent: BackgroundAgent, args: Record<string, string>): void {
-	const signalStatus = args.status;
+	const signalStatus = args.status as "done" | "question" | "error" | undefined;
 	const summary = args.summary || args.question || args.error || "";
 
 	if (signalStatus === "done") {
 		bgAgent.status = "done";
 		bgAgent.endTime = Date.now();
 		appendBgUsageEntry(bgAgent, signalStatus);
-		piRef?.sendMessage(
-			{
-				customType: "subagent-bg",
-				content: `[✅ DONE from ${bgAgent.id}] ${summary.slice(0, 300)}`,
-				display: true,
-			},
-			{ triggerTurn: true },
-		);
-		// Save output in team mode
-		if (bgAgent.teamName && bgAgent.saveAs) {
-			const output = getFinalOutput(bgAgent.result.messages);
-			if (output) {
-				saveOutput(bgAgent.teamName, bgAgent.saveAs, output);
-				bgAgent.result.savedAs = bgAgent.saveAs;
+		const group = bgAgent.groupId ? backgroundGroups.get(bgAgent.groupId) : undefined;
+		if (!group) {
+			piRef?.sendMessage(
+				{
+					customType: "subagent-bg",
+					content: `[✅ DONE from ${bgAgent.id}] ${summary.slice(0, 300)}`,
+					display: true,
+				},
+				{ triggerTurn: true },
+			);
+			if (bgAgent.teamName && bgAgent.saveAs) {
+				const output = getFinalOutput(bgAgent.result.messages);
+				if (output) {
+					saveOutput(bgAgent.teamName, bgAgent.saveAs, output);
+					bgAgent.result.savedAs = bgAgent.saveAs;
+				}
 			}
 		}
 		killBgProcess(bgAgent);
+
+		// V2: Group completion check
+		if (group) {
+			const output = getFinalOutput(bgAgent.result.messages);
+			if (group.mode === "chain") {
+				group.previousOutput = output;
+			}
+			if (bgAgent.teamName && bgAgent.saveAs && output) {
+				saveOutput(bgAgent.teamName, bgAgent.saveAs, output);
+				bgAgent.result.savedAs = bgAgent.saveAs;
+			}
+			if (group.notifyPerTask) {
+				const stepInfo = group.mode === "chain"
+					? `Step ${(group.currentStepIndex ?? 0) + 1}/${group.chainSteps?.length ?? 0} done: ${bgAgent.agent}`
+					: `${bgAgent.id}`;
+				piRef?.sendMessage(
+					{ customType: "subagent-bg", content: `[✅ ${group.mode === "chain" ? group.groupId : bgAgent.id}] ${stepInfo} — ${summary.slice(0, 200)}`, display: true },
+					{ triggerTurn: false },
+				);
+			}
+			if (group.mode === "chain") {
+				advanceChain(group);
+			} else {
+				checkParallelGroupCompletion(group);
+			}
+			trySpawnQueued();
+			updateBgWidget();
+			return;
+		}
+
 		updateBgWidget();
 	} else if (signalStatus === "question") {
 		bgAgent.status = "waiting";
@@ -1036,22 +1088,387 @@ function handleBgSignal(bgAgent: BackgroundAgent, args: Record<string, string>):
 			{ triggerTurn: true },
 		);
 		updateBgWidget();
-		// Process stays alive — waiting for steer
 	} else if (signalStatus === "error") {
 		bgAgent.status = "error";
 		bgAgent.endTime = Date.now();
 		appendBgUsageEntry(bgAgent, signalStatus);
-		piRef?.sendMessage(
-			{
-				customType: "subagent-bg",
-				content: `[❌ ERROR from ${bgAgent.id}] ${summary.slice(0, 300)}`,
-				display: true,
-			},
-			{ triggerTurn: true },
-		);
+		const group = bgAgent.groupId ? backgroundGroups.get(bgAgent.groupId) : undefined;
+		if (!group) {
+			piRef?.sendMessage(
+				{
+					customType: "subagent-bg",
+					content: `[❌ ERROR from ${bgAgent.id}] ${summary.slice(0, 300)}`,
+					display: true,
+				},
+				{ triggerTurn: true },
+			);
+		}
 		killBgProcess(bgAgent);
+
+		// V2: Group error handling
+		if (group) {
+			if (group.notifyPerTask || group.mode === "chain") {
+				piRef?.sendMessage(
+					{ customType: "subagent-bg", content: `[❌ ${group.groupId}] ${bgAgent.id} failed: ${summary.slice(0, 200)}`, display: true },
+					{ triggerTurn: group.mode === "chain" },
+				);
+			}
+			if (group.mode === "chain") {
+				group.status = "error";
+				group.endTime = Date.now();
+				piRef?.sendMessage(
+					{ customType: "subagent-bg", content: `[❌ ${group.groupId}] Step ${(group.currentStepIndex ?? 0) + 1}/${group.chainSteps?.length ?? 0} failed: ${bgAgent.agent} — chain stopped`, display: true },
+					{ triggerTurn: true },
+				);
+				for (const mid of group.memberIds) {
+					const m = backgroundAgents.get(mid);
+					if (m && m.status === "queued") {
+						m.status = "aborted";
+						m.endTime = Date.now();
+					}
+				}
+			} else {
+				checkParallelGroupCompletion(group);
+			}
+			trySpawnQueued();
+			updateBgWidget();
+			return;
+		}
+
 		updateBgWidget();
 	}
+}
+
+function checkParallelGroupCompletion(group: BackgroundGroup): void {
+	const members = group.memberIds.map((id) => backgroundAgents.get(id)).filter(Boolean) as BackgroundAgent[];
+	const allDone = members.every((m) => m.status === "done" || m.status === "error" || m.status === "aborted");
+	if (!allDone) return;
+
+	const succeeded = members.filter((m) => m.status === "done").length;
+	const failed = members.filter((m) => m.status === "error" || m.status === "aborted").length;
+
+	group.status = failed > 0 ? (succeeded > 0 ? "done" : "error") : "done";
+	group.endTime = Date.now();
+
+	const totalUsage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 };
+	for (const m of members) {
+		totalUsage.input += m.result.usage.input;
+		totalUsage.output += m.result.usage.output;
+		totalUsage.cacheRead += m.result.usage.cacheRead;
+		totalUsage.cacheWrite += m.result.usage.cacheWrite;
+		totalUsage.cost += m.result.usage.cost;
+		totalUsage.contextTokens += m.result.usage.contextTokens;
+		totalUsage.turns += m.result.usage.turns;
+	}
+	piRef?.appendEntry("subagent-bg-usage", {
+		id: group.groupId,
+		type: "group",
+		mode: "parallel",
+		status: group.status,
+		members: group.memberIds.length,
+		succeeded,
+		failed,
+		usage: totalUsage,
+		elapsedMs: group.endTime - group.startTime,
+	});
+
+	const icon = failed > 0 ? "⚠️" : "✅";
+	const msg = `[${icon} GROUP DONE: ${group.groupId}] ${succeeded}/${members.length} succeeded${failed > 0 ? `, ${failed} failed` : ""}`;
+	piRef?.sendMessage({ customType: "subagent-bg", content: msg, display: true }, { triggerTurn: true });
+
+	evictCompletedGroups();
+	updateBgWidget();
+}
+
+function advanceChain(group: BackgroundGroup): void {
+	if (!group.chainSteps || group.currentStepIndex === undefined) return;
+
+	const nextIndex = group.currentStepIndex + 1;
+	if (nextIndex >= group.chainSteps.length) {
+		group.status = "done";
+		group.endTime = Date.now();
+
+		const members = group.memberIds.map((id) => backgroundAgents.get(id)).filter(Boolean) as BackgroundAgent[];
+		const totalUsage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 };
+		for (const m of members) {
+			totalUsage.input += m.result.usage.input;
+			totalUsage.output += m.result.usage.output;
+			totalUsage.cacheRead += m.result.usage.cacheRead;
+			totalUsage.cacheWrite += m.result.usage.cacheWrite;
+			totalUsage.cost += m.result.usage.cost;
+			totalUsage.contextTokens += m.result.usage.contextTokens;
+			totalUsage.turns += m.result.usage.turns;
+		}
+		piRef?.appendEntry("subagent-bg-usage", {
+			id: group.groupId,
+			type: "group",
+			mode: "chain",
+			status: "done",
+			steps: group.chainSteps.length,
+			usage: totalUsage,
+			elapsedMs: group.endTime - group.startTime,
+		});
+
+		piRef?.sendMessage(
+			{ customType: "subagent-bg", content: `[✅ CHAIN DONE: ${group.groupId}] All ${group.chainSteps.length} steps completed`, display: true },
+			{ triggerTurn: true },
+		);
+		evictCompletedGroups();
+		updateBgWidget();
+		return;
+	}
+
+	group.currentStepIndex = nextIndex;
+	const stepDef = group.chainSteps[nextIndex];
+	const resolvedTask = stepDef.task.replace(/\{previous\}/g, group.previousOutput || "(no output from previous step)");
+	const taskText = group.teamName ? buildTeamTask(group.teamName, resolvedTask) : resolvedTask;
+
+	const stepCwd = stepDef.cwd ?? process.cwd();
+	const discovered = discoverAgents(stepCwd, "both");
+	const agentConfig = discovered.agents.find((a) => a.name === stepDef.agent);
+	if (!agentConfig) {
+		group.status = "error";
+		group.endTime = Date.now();
+		piRef?.sendMessage(
+			{ customType: "subagent-bg", content: `[❌ ${group.groupId}] Step ${nextIndex + 1}/${group.chainSteps.length} failed: unknown agent "${stepDef.agent}"`, display: true },
+			{ triggerTurn: true },
+		);
+		updateBgWidget();
+		return;
+	}
+
+	const memberId = generateMemberId(group.groupId, stepDef.agent, group.chainSteps.map((s) => s.agent));
+	const spawnArgs = buildBgSpawnArgs(agentConfig, stepDef.mcps, stepDef.extensions, group.teamName);
+
+	const bgAgent: BackgroundAgent = {
+		id: memberId,
+		agent: stepDef.agent,
+		task: taskText,
+		proc: null,
+		result: {
+			agent: stepDef.agent,
+			agentSource: agentConfig.source,
+			task: taskText,
+			exitCode: -1,
+			messages: [],
+			stderr: "",
+			usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
+			startTime: Date.now(),
+		},
+		status: "queued",
+		startTime: Date.now(),
+		cwd: stepDef.cwd ?? process.cwd(),
+		agentConfig,
+		spawnArgs,
+		teamName: group.teamName,
+		saveAs: stepDef.saveAs || stepDef.agent,
+		extensions: stepDef.extensions,
+		mcps: stepDef.mcps,
+		groupId: group.groupId,
+	};
+
+	group.memberIds.push(memberId);
+	backgroundAgents.set(memberId, bgAgent);
+
+	if (group.notifyPerTask) {
+		piRef?.sendMessage(
+			{ customType: "subagent-bg", content: `[🔗 ${group.groupId}] Step ${nextIndex + 1}/${group.chainSteps.length} started: ${stepDef.agent}`, display: true },
+			{ triggerTurn: false },
+		);
+	}
+
+	const runningCount = [...backgroundAgents.values()].filter((a) => a.status === "running" || a.status === "waiting").length;
+	if (runningCount < MAX_BG_CONCURRENCY) {
+		bgAgent.status = "running";
+		launchBackgroundAgent(bgAgent);
+	}
+
+	updateBgWidget();
+}
+
+function evictCompletedGroups(): void {
+	const completed = [...backgroundGroups.entries()]
+		.filter(([_, g]) => g.status === "done" || g.status === "error" || g.status === "aborted")
+		.sort((a, b) => (a[1].endTime || 0) - (b[1].endTime || 0));
+	while (completed.length > MAX_COMPLETED_RETENTION) {
+		const [id] = completed.shift()!;
+		backgroundGroups.delete(id);
+	}
+}
+
+function launchBackgroundParallel(
+	params: { tasks: Array<{ agent: string; task: string; cwd?: string; saveAs?: string; mcps?: string[]; extensions?: string[] }>; saveAs?: string; notifyPerTask?: boolean; background?: boolean },
+	agents: AgentConfig[],
+	defaultCwd: string,
+	teamName?: string,
+): { groupId: string; memberIds: string[]; queuedCount: number } {
+	const groupId = generateGroupId("parallel", params.saveAs);
+	const notifyPerTask = params.notifyPerTask !== false;
+	const allAgentNames = params.tasks.map((t) => t.agent);
+
+	const group: BackgroundGroup = {
+		groupId,
+		mode: "parallel",
+		memberIds: [],
+		status: "running",
+		startTime: Date.now(),
+		notifyPerTask,
+		teamName,
+		saveAs: params.saveAs,
+	};
+	backgroundGroups.set(groupId, group);
+
+	let queuedCount = 0;
+
+	for (const t of params.tasks) {
+		const agentConfig = agents.find((a) => a.name === t.agent);
+		if (!agentConfig) continue;
+
+		const memberId = generateMemberId(groupId, t.agent, allAgentNames);
+		const taskText = teamName ? buildTeamTask(teamName, t.task) : t.task;
+		const spawnArgs = buildBgSpawnArgs(agentConfig, t.mcps, t.extensions, teamName);
+
+		const runningCount = [...backgroundAgents.values()].filter((a) => a.status === "running" || a.status === "waiting").length;
+		const initialStatus = runningCount >= MAX_BG_CONCURRENCY ? "queued" as const : "running" as const;
+		if (initialStatus === "queued") queuedCount++;
+
+		const bgAgent: BackgroundAgent = {
+			id: memberId,
+			agent: t.agent,
+			task: taskText,
+			proc: null,
+			result: {
+				agent: t.agent,
+				agentSource: agentConfig.source,
+				task: taskText,
+				exitCode: -1,
+				messages: [],
+				stderr: "",
+				usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
+				startTime: Date.now(),
+			},
+			status: initialStatus,
+			startTime: Date.now(),
+			cwd: t.cwd ?? defaultCwd,
+			agentConfig,
+			spawnArgs,
+			teamName,
+			saveAs: t.saveAs || t.agent,
+			extensions: t.extensions,
+			mcps: t.mcps,
+			groupId,
+		};
+
+		group.memberIds.push(memberId);
+		backgroundAgents.set(memberId, bgAgent);
+
+		if (initialStatus === "running") {
+			launchBackgroundAgent(bgAgent);
+		}
+	}
+
+	evictCompletedAgents();
+	evictCompletedGroups();
+
+	const agentNames = params.tasks.map((t) => t.agent).join(", ");
+	piRef?.sendMessage(
+		{ customType: "subagent-bg", content: `[🔀 STARTED ${groupId}] ${params.tasks.length} tasks: ${agentNames}`, display: true },
+		{ triggerTurn: false },
+	);
+
+	updateBgWidget();
+	return { groupId, memberIds: group.memberIds, queuedCount };
+}
+
+function launchBackgroundChain(
+	params: { chain: Array<{ agent: string; task: string; cwd?: string; saveAs?: string; mcps?: string[]; extensions?: string[] }>; saveAs?: string; notifyPerTask?: boolean; background?: boolean },
+	agents: AgentConfig[],
+	defaultCwd: string,
+	teamName?: string,
+): { groupId: string; firstMemberId: string } {
+	const groupId = generateGroupId("chain", params.saveAs);
+	const notifyPerTask = params.notifyPerTask !== false;
+	const allAgentNames = params.chain.map((s) => s.agent);
+
+	const group: BackgroundGroup = {
+		groupId,
+		mode: "chain",
+		memberIds: [],
+		status: "running",
+		startTime: Date.now(),
+		chainSteps: params.chain.map((s) => ({
+			agent: s.agent,
+			task: s.task,
+			cwd: s.cwd,
+			saveAs: s.saveAs,
+			mcps: s.mcps,
+			extensions: s.extensions,
+		})),
+		currentStepIndex: 0,
+		notifyPerTask,
+		teamName,
+		saveAs: params.saveAs,
+	};
+	backgroundGroups.set(groupId, group);
+
+	const firstStep = params.chain[0];
+	const agentConfig = agents.find((a) => a.name === firstStep.agent);
+	if (!agentConfig) {
+		group.status = "error";
+		group.endTime = Date.now();
+		return { groupId, firstMemberId: "" };
+	}
+
+	const memberId = generateMemberId(groupId, firstStep.agent, allAgentNames);
+	const taskText = teamName ? buildTeamTask(teamName, firstStep.task) : firstStep.task;
+	const spawnArgs = buildBgSpawnArgs(agentConfig, firstStep.mcps, firstStep.extensions, teamName);
+
+	const runningCount = [...backgroundAgents.values()].filter((a) => a.status === "running" || a.status === "waiting").length;
+	const initialStatus = runningCount >= MAX_BG_CONCURRENCY ? "queued" as const : "running" as const;
+
+	const bgAgent: BackgroundAgent = {
+		id: memberId,
+		agent: firstStep.agent,
+		task: taskText,
+		proc: null,
+		result: {
+			agent: firstStep.agent,
+			agentSource: agentConfig.source,
+			task: taskText,
+			exitCode: -1,
+			messages: [],
+			stderr: "",
+			usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
+			startTime: Date.now(),
+		},
+		status: initialStatus,
+		startTime: Date.now(),
+		cwd: firstStep.cwd ?? defaultCwd,
+		agentConfig,
+		spawnArgs,
+		teamName,
+		saveAs: firstStep.saveAs || firstStep.agent,
+		extensions: firstStep.extensions,
+		mcps: firstStep.mcps,
+		groupId,
+	};
+
+	group.memberIds.push(memberId);
+	backgroundAgents.set(memberId, bgAgent);
+	evictCompletedAgents();
+	evictCompletedGroups();
+
+	if (initialStatus === "running") {
+		launchBackgroundAgent(bgAgent);
+	}
+
+	piRef?.sendMessage(
+		{ customType: "subagent-bg", content: `[🔗 STARTED ${groupId}] ${params.chain.length} steps, starting: ${firstStep.agent}`, display: true },
+		{ triggerTurn: false },
+	);
+
+	updateBgWidget();
+	return { groupId, firstMemberId: memberId };
 }
 
 function killBgProcess(bgAgent: BackgroundAgent): void {
@@ -1154,6 +1571,14 @@ function shutdownAllBackgroundAgents(): void {
 		}
 	}
 	backgroundAgents.clear();
+	// V2: Clean up groups
+	for (const group of backgroundGroups.values()) {
+		if (group.status === "running") {
+			group.status = "aborted";
+			group.endTime = Date.now();
+		}
+	}
+	backgroundGroups.clear();
 	updateBgWidget();
 }
 
@@ -1251,6 +1676,12 @@ const SubagentParams = Type.Object({
 			default: false,
 		}),
 	),
+	notifyPerTask: Type.Optional(
+		Type.Boolean({
+			description: "Fire per-task notifications for background parallel/chain (default: true). Set false for group-only completion notifications.",
+			default: true,
+		}),
+	),
 });
 
 export default function (pi: ExtensionAPI) {
@@ -1317,11 +1748,40 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 
-			if (params.background && (hasChain || hasTasks)) {
+			// ── V2: Background parallel ──
+			if (params.background && hasTasks) {
+				const { groupId, memberIds, queuedCount } = launchBackgroundParallel(
+					{ tasks: params.tasks!, saveAs: params.saveAs, notifyPerTask: params.notifyPerTask },
+					agents, ctx.cwd, teamName,
+				);
+				const runningCount = memberIds.length - queuedCount;
 				return {
-					content: [{ type: "text", text: "background: true is only supported in single mode (V1). Use agent + task." }],
-					details: makeDetails(hasChain ? "chain" : "parallel")([]),
-					isError: true,
+					content: [{
+						type: "text",
+						text: `Background parallel group started: ${groupId}\n` +
+							`Members: ${memberIds.join(", ")}\n` +
+							`Status: ${runningCount} running, ${queuedCount} queued\n` +
+							`Use subagent_status(id: "${groupId}") to check progress.`,
+					}],
+					details: makeDetails("parallel")([]),
+				};
+			}
+
+			// ── V2: Background chain ──
+			if (params.background && hasChain) {
+				const { groupId, firstMemberId } = launchBackgroundChain(
+					{ chain: params.chain!, saveAs: params.saveAs, notifyPerTask: params.notifyPerTask },
+					agents, ctx.cwd, teamName,
+				);
+				return {
+					content: [{
+						type: "text",
+						text: `Background chain started: ${groupId}\n` +
+							`Steps: ${params.chain!.map((s) => s.agent).join(" → ")}\n` +
+							`First step: ${firstMemberId || "(failed to start)"}\n` +
+							`Use subagent_status(id: "${groupId}") to check progress.`,
+					}],
+					details: makeDetails("chain")([]),
 				};
 			}
 
@@ -1989,29 +2449,58 @@ export default function (pi: ExtensionAPI) {
 			),
 		}),
 		async execute(_toolCallId, params) {
+			// V2: Group resolution
+			const resolved = resolveId(params.id);
+			if (resolved.type === "group") {
+				const group = resolved.group;
+				if (group.mode === "parallel") {
+					const memberList = group.memberIds.join(", ");
+					return {
+						content: [{ type: "text", text: `Cannot steer a parallel group directly. Specify a member: ${memberList}` }],
+						details: undefined,
+						isError: true,
+					};
+				}
+				if (group.currentStepIndex !== undefined) {
+					const activeId = group.memberIds[group.memberIds.length - 1];
+					const activeAgent = backgroundAgents.get(activeId);
+					if (activeAgent && (activeAgent.status === "running" || activeAgent.status === "waiting")) {
+						params.id = activeId;
+					} else {
+						return {
+							content: [{ type: "text", text: `Chain "${group.groupId}" has no active running step to steer.` }],
+							details: undefined,
+							isError: true,
+						};
+					}
+				}
+			}
+
 			const bgAgent = backgroundAgents.get(params.id);
 			if (!bgAgent) {
 				return {
 					content: [{ type: "text", text: `No background agent found with id "${params.id}"` }],
+					details: undefined,
 					isError: true,
 				};
 			}
 			if (bgAgent.status !== "running" && bgAgent.status !== "waiting") {
 				return {
 					content: [{ type: "text", text: `Agent "${params.id}" is ${bgAgent.status}, cannot steer.` }],
+					details: undefined,
 					isError: true,
 				};
 			}
 			if (!bgAgent.proc || bgAgent.proc.killed) {
 				return {
 					content: [{ type: "text", text: `Agent "${params.id}" process is not alive.` }],
+					details: undefined,
 					isError: true,
 				};
 			}
 
 			if (params.interrupt) {
 				bgAgent.proc.stdin!.write(JSON.stringify({ type: "abort" }) + "\n");
-				// Brief pause before sending new prompt
 				await new Promise((r) => setTimeout(r, 500));
 			}
 
@@ -2032,6 +2521,7 @@ export default function (pi: ExtensionAPI) {
 						text: `Steered "${params.id}": ${params.interrupt ? "(interrupted) " : ""}${params.message.slice(0, 100)}`,
 					},
 				],
+				details: undefined,
 			};
 		},
 		renderResult(result) {
@@ -2049,6 +2539,49 @@ export default function (pi: ExtensionAPI) {
 		}),
 		async execute(_toolCallId, params) {
 			if (params.id) {
+				// V2: Check if it's a group ID first
+				const resolved = resolveId(params.id);
+				if (resolved.type === "group") {
+					const group = resolved.group;
+					const members = group.memberIds.map((id) => backgroundAgents.get(id)).filter(Boolean) as BackgroundAgent[];
+					const elapsed = formatDuration((group.endTime ?? Date.now()) - group.startTime);
+
+					let statusLine: string;
+					if (group.mode === "parallel") {
+						const done = members.filter((m) => m.status === "done" || m.status === "error" || m.status === "aborted").length;
+						statusLine = `Status: ${group.status} (${done}/${members.length} done)`;
+					} else {
+						statusLine = `Status: ${group.status} — step ${(group.currentStepIndex ?? 0) + 1}/${group.chainSteps?.length ?? 0}`;
+					}
+
+					const memberLines = members.map((m) => {
+						const mElapsed = formatDuration((m.endTime ?? Date.now()) - m.startTime);
+						const icon = m.status === "done" ? "✅" : m.status === "error" ? "❌" : m.status === "running" ? "⏳" : m.status === "queued" ? "📋" : m.status === "aborted" ? "🛑" : "⏸️";
+						return `  ${icon} ${m.id} — ${m.status} (${mElapsed}, ${m.result.usage.turns} turns)`;
+					});
+
+					if (group.mode === "chain" && group.chainSteps) {
+						const startedCount = group.memberIds.length;
+						for (let i = startedCount; i < group.chainSteps.length; i++) {
+							memberLines.push(`  ⏸️ step ${i + 1}: ${group.chainSteps[i].agent} — pending`);
+						}
+					}
+
+					return {
+						content: [{
+							type: "text",
+							text: [
+								`Group: ${group.groupId} (${group.mode}, ${group.mode === "chain" ? `${group.chainSteps?.length ?? 0} steps` : `${members.length} tasks`})`,
+								statusLine,
+								`Elapsed: ${elapsed}`,
+								group.mode === "parallel" ? "Members:" : "Steps:",
+								...memberLines,
+							].join("\n"),
+						}],
+						details: { mode: "single" as const, results: members.map((m) => m.result) },
+					};
+				}
+
 				const bgAgent = backgroundAgents.get(params.id);
 				if (!bgAgent) {
 					return {
@@ -2096,9 +2629,13 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 
-			// All agents summary
 			const entries = [...backgroundAgents.values()];
-			if (entries.length === 0) {
+			const groupEntries = [...backgroundGroups.values()].filter(
+				(g) => g.status === "running" || g.status === "error" || g.status === "done" || g.status === "aborted",
+			);
+			const soloEntries = entries.filter((a) => !a.groupId);
+
+			if (groupEntries.length === 0 && soloEntries.length === 0) {
 				return {
 					content: [{ type: "text", text: "No background agents." }],
 					details: {
@@ -2108,9 +2645,20 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 
-			const queuedEntries = entries.filter((a) => a.status === "queued");
+			const queuedEntries = soloEntries.filter((a) => a.status === "queued");
 			const queuePositions = new Map(queuedEntries.map((a, index) => [a.id, index + 1]));
-			const lines = entries.map((a) => {
+			const groupLines = groupEntries.map((g) => {
+				const elapsed = formatDuration((g.endTime ?? Date.now()) - g.startTime);
+				if (g.mode === "parallel") {
+					const members = g.memberIds.map((id) => backgroundAgents.get(id)).filter(Boolean) as BackgroundAgent[];
+					const done = members.filter((m) => m.status === "done" || m.status === "error" || m.status === "aborted").length;
+					const icon = g.status === "done" ? "✅" : g.status === "error" ? "❌" : g.status === "aborted" ? "🛑" : "🔀";
+					return `${icon} ${g.groupId} (parallel) — ${done}/${members.length} done — ${elapsed}`;
+				}
+				const icon = g.status === "done" ? "✅" : g.status === "error" ? "❌" : g.status === "aborted" ? "🛑" : "🔗";
+				return `${icon} ${g.groupId} (chain) — step ${(g.currentStepIndex ?? 0) + 1}/${g.chainSteps?.length ?? 0} — ${elapsed}`;
+			});
+			const soloLines = soloEntries.map((a) => {
 				const elapsed = formatDuration((a.endTime ?? Date.now()) - a.startTime);
 				const icon =
 					a.status === "running" ? "⏳" :
@@ -2122,7 +2670,7 @@ export default function (pi: ExtensionAPI) {
 				const queueInfo = a.status === "queued" ? ` (position ${queuePositions.get(a.id)})` : "";
 				return `${icon} ${a.id} (${a.agent}) — ${a.status}${queueInfo} — ${elapsed} — ${a.result.usage.turns} turns`;
 			});
-
+			const lines = [...groupLines, ...soloLines];
 			const running = entries.filter((a) => a.status === "running" || a.status === "waiting").length;
 			const queued = entries.filter((a) => a.status === "queued").length;
 
@@ -2130,12 +2678,12 @@ export default function (pi: ExtensionAPI) {
 				content: [
 					{
 						type: "text",
-						text: `Background agents (${running} running, ${queued} queued):\n${lines.join("\n")}`,
+						text: `Background agents (${groupEntries.length} groups, ${soloEntries.length} solo, ${running} running, ${queued} queued):\n${lines.join("\n")}`,
 					},
 				],
 				details: {
 					mode: "single" as const,
-					results: entries.map((a) => a.result),
+					results: [...groupEntries.flatMap((g) => g.memberIds.map((id) => backgroundAgents.get(id)).filter(Boolean) as BackgroundAgent[]), ...soloEntries].map((a) => a.result),
 				},
 			};
 		},
@@ -2153,6 +2701,54 @@ export default function (pi: ExtensionAPI) {
 			id: Type.String({ description: "Background agent job ID" }),
 		}),
 		async execute(_toolCallId, params) {
+			// V2: Group resolution
+			const resolved = resolveId(params.id);
+			if (resolved.type === "group") {
+				const group = resolved.group;
+				if (group.status === "done" || group.status === "error" || group.status === "aborted") {
+					return {
+						content: [{ type: "text", text: `Group "${group.groupId}" already ${group.status}.` }],
+						details: {
+							mode: "single" as const,
+							results: (group.memberIds.map((id) => backgroundAgents.get(id)).filter(Boolean) as BackgroundAgent[]).map((m) => m.result),
+						},
+					};
+				}
+				group.status = "aborted";
+				group.endTime = Date.now();
+
+				let stoppedCount = 0;
+				for (const mid of group.memberIds) {
+					const m = backgroundAgents.get(mid);
+					if (m && (m.status === "running" || m.status === "waiting")) {
+						m.status = "aborted";
+						m.endTime = Date.now();
+						killBgProcess(m);
+						stoppedCount++;
+					} else if (m && m.status === "queued") {
+						m.status = "aborted";
+						m.endTime = Date.now();
+						stoppedCount++;
+					}
+				}
+
+				piRef?.sendMessage(
+					{ customType: "subagent-bg", content: `[🛑 ABORTED ${group.groupId}]`, display: true },
+					{ triggerTurn: false },
+				);
+
+				updateBgWidget();
+				trySpawnQueued();
+
+				return {
+					content: [{ type: "text", text: `Stopped group "${group.groupId}". ${stoppedCount} members aborted.` }],
+					details: {
+						mode: "single" as const,
+						results: (group.memberIds.map((id) => backgroundAgents.get(id)).filter(Boolean) as BackgroundAgent[]).map((m) => m.result),
+					},
+				};
+			}
+
 			const bgAgent = backgroundAgents.get(params.id);
 			if (!bgAgent) {
 				return {
@@ -2183,7 +2779,6 @@ export default function (pi: ExtensionAPI) {
 				killBgProcess(bgAgent);
 			}
 
-			// Save partial output in team mode
 			if (bgAgent.teamName && bgAgent.saveAs) {
 				const output = getFinalOutput(bgAgent.result.messages);
 				if (output) {
@@ -2201,11 +2796,33 @@ export default function (pi: ExtensionAPI) {
 				{ triggerTurn: false },
 			);
 
-			updateBgWidget();
-
-			if (wasQueued) {
-				trySpawnQueued();
+			if (bgAgent.groupId) {
+				const group = backgroundGroups.get(bgAgent.groupId);
+				if (group) {
+					if (group.mode === "chain") {
+						group.status = "aborted";
+						group.endTime = Date.now();
+						for (const mid of group.memberIds) {
+							const member = backgroundAgents.get(mid);
+							if (member && member.id !== bgAgent.id && (member.status === "running" || member.status === "waiting" || member.status === "queued")) {
+								const memberWasQueued = member.status === "queued";
+								member.status = "aborted";
+								member.endTime = Date.now();
+								if (!memberWasQueued) killBgProcess(member);
+							}
+						}
+						piRef?.sendMessage(
+							{ customType: "subagent-bg", content: `[🛑 ABORTED ${group.groupId}]`, display: true },
+							{ triggerTurn: false },
+						);
+					} else {
+						checkParallelGroupCompletion(group);
+					}
+				}
 			}
+
+			updateBgWidget();
+			trySpawnQueued();
 
 			return {
 				content: [
@@ -2266,7 +2883,7 @@ export default function (pi: ExtensionAPI) {
 						`  Dir: ${dir}\n` +
 						`  Write shared context to: ${dir}/shared_context.md\n` +
 						`  Outputs will be saved to: ${dir}/outputs/`,
-					"success",
+					"info",
 				);
 				return;
 			}
@@ -2336,7 +2953,7 @@ export default function (pi: ExtensionAPI) {
 					}
 				}
 				deleteTeam(teamArg);
-				ctx.ui.notify(`Team "${teamArg}" deleted.`, "success");
+				ctx.ui.notify(`Team "${teamArg}" deleted.`, "info");
 				return;
 			}
 
