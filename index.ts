@@ -822,16 +822,6 @@ function launchBackgroundAgent(bgAgent: BackgroundAgent): void {
 					.filter((p: any) => p.type === "toolCall")
 					.map((p: any) => p.name)
 					.slice(0, 3);
-				const toolSummary = toolCalls.length > 0 ? toolCalls.join(", ") : "thinking";
-				piRef?.sendMessage(
-					{
-						customType: "subagent-bg",
-						content: `[⏳ ${bgAgent.id}] Turn ${turnNum}: ${toolSummary}`,
-						display: true,
-					},
-					{ triggerTurn: false },
-				);
-
 				// Idle detection for RPC mode: if turn ended with no __bg_signal and no pending tool calls,
 				// treat as implicit done
 				if (msg.stopReason === "endTurn" && !signalDetected) {
