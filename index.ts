@@ -404,6 +404,7 @@ interface BackgroundAgent {
 const backgroundAgents = new Map<string, BackgroundAgent>();
 const bgAutoCounter = new Map<string, number>();
 let piRef: ExtensionAPI | null = null;
+let bgWidgetInterval: ReturnType<typeof setInterval> | null = null;
 
 // UI context captured on session_start — used for widget updates
 let uiSetWidget: ((key: string, content: string[] | undefined) => void) | null = null;
@@ -424,7 +425,16 @@ function updateBgWidget(): void {
 
 	if (active.length === 0) {
 		uiSetWidget("subagent-bg", undefined);
+		if (bgWidgetInterval) {
+			clearInterval(bgWidgetInterval);
+			bgWidgetInterval = null;
+		}
 		return;
+	}
+
+	// Keep elapsed time ticking while agents are active
+	if (!bgWidgetInterval) {
+		bgWidgetInterval = setInterval(updateBgWidget, 1000);
 	}
 
 	const lines = active.map((a) => {
@@ -585,6 +595,9 @@ async function runSingleAgent(
 		}
 	};
 
+	// Tick elapsed time every second while agent is running
+	const elapsedInterval = onUpdate ? setInterval(emitUpdate, 1000) : null;
+
 	try {
 		if (agent.systemPrompt.trim()) {
 			const tmp = writePromptToTempFile(agent.name, agent.systemPrompt);
@@ -685,6 +698,10 @@ async function runSingleAgent(
 		if (wasAborted) throw new Error("Subagent was aborted");
 		return currentResult;
 	} finally {
+		// Stop elapsed time ticker
+		if (elapsedInterval) clearInterval(elapsedInterval);
+
+		// Clean up temp prompt file
 		if (tmpPromptPath)
 			try {
 				fs.unlinkSync(tmpPromptPath);
@@ -1668,8 +1685,10 @@ export default function (pi: ExtensionAPI) {
 
 			if (details.mode === "single" && details.results.length === 1) {
 				const r = details.results[0];
-				const isError = r.exitCode !== 0 || r.stopReason === "error" || r.stopReason === "aborted";
-				const icon = isError ? theme.fg("error", "✗") : theme.fg("success", "✓");
+				const resultText = result.content[0]?.type === "text" ? result.content[0].text : "";
+				const isBackground = resultText.startsWith("Background agent started") || resultText.startsWith("Background agent queued");
+				const isError = !isBackground && (r.exitCode !== 0 || r.stopReason === "error" || r.stopReason === "aborted");
+				const icon = isBackground ? "🏃" : isError ? theme.fg("error", "✗") : theme.fg("success", "✓");
 				const displayItems = getDisplayItems(r.messages);
 				const finalOutput = getFinalOutput(r.messages);
 
