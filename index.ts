@@ -937,6 +937,7 @@ function launchBackgroundAgent(bgAgent: BackgroundAgent): void {
 		if (bgAgent.status === "running" || bgAgent.status === "waiting") {
 			bgAgent.status = code === 0 ? "done" : "error";
 			bgAgent.endTime = Date.now();
+			appendBgUsageEntry(bgAgent, bgAgent.status);
 
 			const summary = getFinalOutput(bgAgent.result.messages) || "(no output)";
 			const icon = bgAgent.status === "done" ? "✅ DONE" : "❌ ERROR";
@@ -969,6 +970,7 @@ function launchBackgroundAgent(bgAgent: BackgroundAgent): void {
 		if (bgAgent.status === "running" || bgAgent.status === "waiting") {
 			bgAgent.status = "error";
 			bgAgent.endTime = Date.now();
+			appendBgUsageEntry(bgAgent, bgAgent.status);
 			piRef?.sendMessage(
 				{
 					customType: "subagent-bg",
@@ -1004,6 +1006,7 @@ function handleBgSignal(bgAgent: BackgroundAgent, args: Record<string, string>):
 	if (signalStatus === "done") {
 		bgAgent.status = "done";
 		bgAgent.endTime = Date.now();
+		appendBgUsageEntry(bgAgent, signalStatus);
 		piRef?.sendMessage(
 			{
 				customType: "subagent-bg",
@@ -1037,6 +1040,7 @@ function handleBgSignal(bgAgent: BackgroundAgent, args: Record<string, string>):
 	} else if (signalStatus === "error") {
 		bgAgent.status = "error";
 		bgAgent.endTime = Date.now();
+		appendBgUsageEntry(bgAgent, signalStatus);
 		piRef?.sendMessage(
 			{
 				customType: "subagent-bg",
@@ -1090,6 +1094,18 @@ function cleanupBgAgent(bgAgent: BackgroundAgent): void {
 	if (bgAgent.mcpCleanupName && bgAgent.teamName) {
 		try { removeScopedMcpConfig(bgAgent.teamName, bgAgent.mcpCleanupName); } catch { /* ignore */ }
 	}
+}
+
+function appendBgUsageEntry(bgAgent: BackgroundAgent, status: BackgroundAgent["status"]): void {
+	piRef?.appendEntry("subagent-bg-usage", {
+		id: bgAgent.id,
+		agent: bgAgent.agent,
+		status,
+		usage: bgAgent.result.usage,
+		model: bgAgent.result.model,
+		provider: bgAgent.result.provider,
+		elapsedMs: (bgAgent.endTime ?? Date.now()) - bgAgent.startTime,
+	});
 }
 
 function trySpawnQueued(): void {
@@ -2037,6 +2053,10 @@ export default function (pi: ExtensionAPI) {
 				if (!bgAgent) {
 					return {
 						content: [{ type: "text", text: `No background agent found with id "${params.id}"` }],
+						details: {
+							mode: "single" as const,
+							results: [],
+						},
 						isError: true,
 					};
 				}
@@ -2069,13 +2089,23 @@ export default function (pi: ExtensionAPI) {
 								.join("\n"),
 						},
 					],
+					details: {
+						mode: "single" as const,
+						results: [bgAgent.result],
+					},
 				};
 			}
 
 			// All agents summary
 			const entries = [...backgroundAgents.values()];
 			if (entries.length === 0) {
-				return { content: [{ type: "text", text: "No background agents." }] };
+				return {
+					content: [{ type: "text", text: "No background agents." }],
+					details: {
+						mode: "single" as const,
+						results: [],
+					},
+				};
 			}
 
 			const queuedEntries = entries.filter((a) => a.status === "queued");
@@ -2103,6 +2133,10 @@ export default function (pi: ExtensionAPI) {
 						text: `Background agents (${running} running, ${queued} queued):\n${lines.join("\n")}`,
 					},
 				],
+				details: {
+					mode: "single" as const,
+					results: entries.map((a) => a.result),
+				},
 			};
 		},
 		renderResult(result) {
@@ -2123,6 +2157,10 @@ export default function (pi: ExtensionAPI) {
 			if (!bgAgent) {
 				return {
 					content: [{ type: "text", text: `No background agent found with id "${params.id}"` }],
+					details: {
+						mode: "single" as const,
+						results: [],
+					},
 					isError: true,
 				};
 			}
@@ -2130,6 +2168,10 @@ export default function (pi: ExtensionAPI) {
 			if (bgAgent.status === "done" || bgAgent.status === "error" || bgAgent.status === "aborted") {
 				return {
 					content: [{ type: "text", text: `Agent "${params.id}" already ${bgAgent.status}.` }],
+					details: {
+						mode: "single" as const,
+						results: [bgAgent.result],
+					},
 				};
 			}
 
@@ -2172,6 +2214,10 @@ export default function (pi: ExtensionAPI) {
 						text: `Stopped "${params.id}". ${bgAgent.result.usage.turns} turns completed before abort.`,
 					},
 				],
+				details: {
+					mode: "single" as const,
+					results: [bgAgent.result],
+				},
 			};
 		},
 		renderResult(result) {
