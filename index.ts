@@ -485,6 +485,7 @@ function updateBgWidget(): void {
 		lines.push(`  ${icon} ${a.id} — ${a.status} (${elapsed})`);
 	}
 
+	lines.sort();
 	uiSetWidget("subagent-bg", [`🤖 Background agents (${totalActive})`, ...lines]);
 }
 
@@ -1049,7 +1050,7 @@ function handleBgSignal(bgAgent: BackgroundAgent, args: Record<string, string>):
 
 		// V2: Group completion check
 		if (group) {
-			const output = getFinalOutput(bgAgent.result.messages);
+			const output = summary || getFinalOutput(bgAgent.result.messages);
 			if (group.mode === "chain") {
 				group.previousOutput = output;
 			}
