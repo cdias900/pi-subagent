@@ -12,7 +12,7 @@
  * Uses JSON mode to capture structured output from subagents.
  */
 
-import { spawn } from "node:child_process";
+import { type ChildProcess, spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -137,6 +137,8 @@ function findMcpBridgePath(agentDir: string): string | null {
 const MAX_PARALLEL_TASKS = 8;
 const MAX_CONCURRENCY = 4;
 const COLLAPSED_ITEM_COUNT = 10;
+const MAX_BG_CONCURRENCY = 8;
+const MAX_COMPLETED_RETENTION = 20;
 
 function formatTokens(count: number): string {
 	if (count < 1000) return count.toString();
@@ -375,6 +377,32 @@ interface SubagentDetails {
 	team?: string;
 	results: SingleResult[];
 }
+
+interface BackgroundAgent {
+	id: string;
+	agent: string;
+	task: string;
+	proc: ChildProcess | null;
+	result: SingleResult;
+	status: "queued" | "running" | "waiting" | "done" | "error" | "aborted";
+	startTime: number;
+	endTime?: number;
+	cwd: string;
+	agentConfig: AgentConfig;
+	spawnArgs: string[];
+	spawnEnv?: Record<string, string | undefined>;
+	tmpPromptDir?: string;
+	tmpPromptPath?: string;
+	mcpCleanupName?: string;
+	teamName?: string;
+	saveAs?: string;
+	extensions?: string[];
+	mcps?: string[];
+}
+
+const backgroundAgents = new Map<string, BackgroundAgent>();
+const bgAutoCounter = new Map<string, number>();
+let piRef: ExtensionAPI | null = null;
 
 function getFinalOutput(messages: Message[]): string {
 	for (let i = messages.length - 1; i >= 0; i--) {
@@ -644,6 +672,422 @@ async function runSingleAgent(
 	}
 }
 
+// ── Background agent helpers ─────────────────────────────────────
+
+const BG_SIGNAL_INSTRUCTION = `
+You have a __bg_signal tool. You MUST call it when:
+- Your task is complete: __bg_signal(status: "done", summary: "what you accomplished")
+- You need input to continue: __bg_signal(status: "question", question: "what you need")
+- You hit an unrecoverable error: __bg_signal(status: "error", error: "what went wrong")
+Do NOT forget to call __bg_signal(status: "done") when you finish your task.
+`.trim();
+
+function generateBgId(agentName: string, explicitId?: string): string {
+	if (explicitId && !backgroundAgents.has(explicitId)) return explicitId;
+	const counter = (bgAutoCounter.get(agentName) || 0) + 1;
+	bgAutoCounter.set(agentName, counter);
+	const id = `${agentName}-${counter}`;
+	if (!backgroundAgents.has(id)) return id;
+	return `${agentName}-${counter}-${Date.now().toString(36).slice(-4)}`;
+}
+
+function buildBgSpawnArgs(
+	agentConfig: AgentConfig,
+	mcps?: string[],
+	runtimeExtensions?: string[],
+	teamName?: string,
+): string[] {
+	const args: string[] = ["--mode", "rpc", "--no-session", "--no-extensions"];
+
+	const agentDir = getAgentDir();
+	const allExtensions = new Set<string>([
+		...(agentConfig.extensions || []),
+		...(runtimeExtensions || []),
+	]);
+	if (allExtensions.size > 0) {
+		const extensionPaths = resolveExtensionPaths(agentDir, [...allExtensions]);
+		for (const extPath of extensionPaths) {
+			args.push("-e", extPath);
+		}
+	}
+
+	if (mcps && mcps.length > 0 && teamName) {
+		const bridgePath = findMcpBridgePath(agentDir);
+		if (bridgePath) {
+			args.push("-e", bridgePath);
+		}
+	}
+
+	if (agentConfig.model) args.push("--model", agentConfig.model);
+	if (agentConfig.tools && agentConfig.tools.length > 0) args.push("--tools", agentConfig.tools.join(","));
+
+	return args;
+}
+
+function launchBackgroundAgent(bgAgent: BackgroundAgent): void {
+	let tmpPromptDir: string | null = null;
+	let tmpPromptPath: string | null = null;
+
+	// Write system prompt with __bg_signal instructions
+	const fullSystemPrompt = [bgAgent.agentConfig.systemPrompt.trim(), BG_SIGNAL_INSTRUCTION]
+		.filter(Boolean)
+		.join("\n\n");
+
+	if (fullSystemPrompt) {
+		const tmp = writePromptToTempFile(bgAgent.agentConfig.name, fullSystemPrompt);
+		tmpPromptDir = tmp.dir;
+		tmpPromptPath = tmp.filePath;
+		bgAgent.tmpPromptDir = tmpPromptDir;
+		bgAgent.tmpPromptPath = tmpPromptPath;
+		bgAgent.spawnArgs.push("--append-system-prompt", tmpPromptPath);
+	}
+
+	// Set up MCP config if needed
+	let mcpConfigPath: string | null = null;
+	if (bgAgent.mcps && bgAgent.mcps.length > 0 && bgAgent.teamName) {
+		const mcpSaveAs = `bg-${bgAgent.id}-${Date.now()}`;
+		mcpConfigPath = writeScopedMcpConfig(bgAgent.teamName, mcpSaveAs, bgAgent.mcps);
+		bgAgent.mcpCleanupName = mcpSaveAs;
+	}
+
+	const spawnEnv = mcpConfigPath
+		? { ...process.env, PI_MCP_CONFIG: mcpConfigPath }
+		: undefined;
+
+	const proc = spawn("pi", bgAgent.spawnArgs, {
+		cwd: bgAgent.cwd,
+		shell: false,
+		stdio: ["pipe", "pipe", "pipe"],
+		...(spawnEnv ? { env: spawnEnv } : {}),
+	});
+
+	bgAgent.proc = proc;
+	bgAgent.status = "running";
+	bgAgent.startTime = Date.now();
+
+	let buffer = "";
+
+	let pendingBgSignal: Record<string, string> | null = null;
+
+	const processLine = (line: string) => {
+		if (!line.trim()) return;
+		let event: any;
+		try {
+			event = JSON.parse(line);
+		} catch {
+			return;
+		}
+		let signalDetected: Record<string, string> | null = pendingBgSignal;
+
+		if (event.type === "tool_call") {
+			const toolName = event.name ?? event.toolCall?.name;
+			const toolArgs = event.arguments ?? event.toolCall?.arguments;
+			if (toolName === "__bg_signal") {
+				pendingBgSignal = (toolArgs || {}) as Record<string, string>;
+				signalDetected = pendingBgSignal;
+			}
+		}
+
+		if (event.type === "message_end" && event.message) {
+			const msg = event.message as Message;
+			bgAgent.result.messages.push(msg);
+
+			if (msg.role === "assistant") {
+				for (const part of msg.content) {
+					if (part.type === "toolCall" && part.name === "__bg_signal") {
+						signalDetected = part.arguments as Record<string, string>;
+						pendingBgSignal = signalDetected;
+						break;
+					}
+				}
+
+				bgAgent.result.usage.turns++;
+				const usage = msg.usage;
+				if (usage) {
+					bgAgent.result.usage.input += usage.input || 0;
+					bgAgent.result.usage.output += usage.output || 0;
+					bgAgent.result.usage.cacheRead += usage.cacheRead || 0;
+					bgAgent.result.usage.cacheWrite += usage.cacheWrite || 0;
+					bgAgent.result.usage.cost += usage.cost?.total || 0;
+					bgAgent.result.usage.contextTokens = usage.totalTokens || 0;
+				}
+				if (!bgAgent.result.model && msg.model) bgAgent.result.model = msg.model;
+				if (!bgAgent.result.provider && (msg as any).provider) bgAgent.result.provider = (msg as any).provider;
+				if (msg.stopReason) bgAgent.result.stopReason = msg.stopReason;
+				if (msg.errorMessage) bgAgent.result.errorMessage = msg.errorMessage;
+
+				// Emit turn progress notification (non-interrupting)
+				const turnNum = bgAgent.result.usage.turns;
+				const toolCalls = msg.content
+					.filter((p: any) => p.type === "toolCall")
+					.map((p: any) => p.name)
+					.slice(0, 3);
+				const toolSummary = toolCalls.length > 0 ? toolCalls.join(", ") : "thinking";
+				piRef?.sendMessage(
+					{
+						customType: "subagent-bg",
+						content: `[⏳ ${bgAgent.id}] Turn ${turnNum}: ${toolSummary}`,
+						display: true,
+					},
+					{ triggerTurn: false },
+				);
+
+				// Idle detection for RPC mode: if turn ended with no __bg_signal and no pending tool calls,
+				// treat as implicit done
+				if (msg.stopReason === "endTurn" && !signalDetected) {
+					const hasPendingToolCalls = msg.content.some((p: any) => p.type === "toolCall" && p.name !== "__bg_signal");
+					if (!hasPendingToolCalls && bgAgent.status === "running") {
+						bgAgent.status = "done";
+						bgAgent.endTime = Date.now();
+						const summary = getFinalOutput(bgAgent.result.messages) || "(no output)";
+						piRef?.sendMessage(
+							{
+								customType: "subagent-bg",
+								content: `[✅ DONE from ${bgAgent.id}] ${summary.slice(0, 200)}`,
+								display: true,
+							},
+							{ triggerTurn: true },
+						);
+						if (bgAgent.teamName && bgAgent.saveAs) {
+							const output = getFinalOutput(bgAgent.result.messages);
+							if (output) {
+								saveOutput(bgAgent.teamName, bgAgent.saveAs, output);
+								bgAgent.result.savedAs = bgAgent.saveAs;
+							}
+						}
+						killBgProcess(bgAgent);
+					}
+				}
+
+				if (signalDetected) {
+					pendingBgSignal = null;
+					handleBgSignal(bgAgent, signalDetected);
+				}
+			}
+		}
+
+		if (event.type === "tool_result_end" && event.message) {
+			bgAgent.result.messages.push(event.message as Message);
+		}
+	};
+
+	proc.stdout!.on("data", (data: Buffer) => {
+		buffer += data.toString();
+		const lines = buffer.split("\n");
+		buffer = lines.pop() || "";
+		for (const line of lines) processLine(line);
+	});
+
+	proc.stderr!.on("data", (data: Buffer) => {
+		bgAgent.result.stderr += data.toString();
+	});
+
+	proc.on("close", (code: number | null) => {
+		if (buffer.trim()) processLine(buffer);
+		bgAgent.result.exitCode = code ?? 0;
+
+		// Only finalize if not already done by __bg_signal
+		if (bgAgent.status === "running" || bgAgent.status === "waiting") {
+			bgAgent.status = code === 0 ? "done" : "error";
+			bgAgent.endTime = Date.now();
+
+			const summary = getFinalOutput(bgAgent.result.messages) || "(no output)";
+			const icon = bgAgent.status === "done" ? "✅ DONE" : "❌ ERROR";
+			piRef?.sendMessage(
+				{
+					customType: "subagent-bg",
+					content: `[${icon} from ${bgAgent.id}] ${summary.slice(0, 200)}`,
+					display: true,
+				},
+				{ triggerTurn: true },
+			);
+
+			// Save output in team mode
+			if (bgAgent.teamName && bgAgent.saveAs && bgAgent.status === "done") {
+				const output = getFinalOutput(bgAgent.result.messages);
+				if (output) {
+					saveOutput(bgAgent.teamName, bgAgent.saveAs, output);
+					bgAgent.result.savedAs = bgAgent.saveAs;
+				}
+			}
+		}
+
+		cleanupBgAgent(bgAgent);
+		trySpawnQueued();
+	});
+
+	proc.on("error", () => {
+		bgAgent.result.exitCode = 1;
+		if (bgAgent.status === "running" || bgAgent.status === "waiting") {
+			bgAgent.status = "error";
+			bgAgent.endTime = Date.now();
+			piRef?.sendMessage(
+				{
+					customType: "subagent-bg",
+					content: `[❌ ERROR from ${bgAgent.id}] Process failed to start`,
+					display: true,
+				},
+				{ triggerTurn: true },
+			);
+		}
+		cleanupBgAgent(bgAgent);
+		trySpawnQueued();
+	});
+
+	// Send initial prompt via stdin
+	const prompt = JSON.stringify({ type: "prompt", message: `Task: ${bgAgent.task}` }) + "\n";
+	proc.stdin!.write(prompt);
+
+	piRef?.sendMessage(
+		{
+			customType: "subagent-bg",
+			content: `[🚀 STARTED ${bgAgent.id}] ${bgAgent.agent} — ${bgAgent.task.slice(0, 100)}`,
+			display: true,
+		},
+		{ triggerTurn: false },
+	);
+}
+
+function handleBgSignal(bgAgent: BackgroundAgent, args: Record<string, string>): void {
+	const signalStatus = args.status;
+	const summary = args.summary || args.question || args.error || "";
+
+	if (signalStatus === "done") {
+		bgAgent.status = "done";
+		bgAgent.endTime = Date.now();
+		piRef?.sendMessage(
+			{
+				customType: "subagent-bg",
+				content: `[✅ DONE from ${bgAgent.id}] ${summary.slice(0, 300)}`,
+				display: true,
+			},
+			{ triggerTurn: true },
+		);
+		// Save output in team mode
+		if (bgAgent.teamName && bgAgent.saveAs) {
+			const output = getFinalOutput(bgAgent.result.messages);
+			if (output) {
+				saveOutput(bgAgent.teamName, bgAgent.saveAs, output);
+				bgAgent.result.savedAs = bgAgent.saveAs;
+			}
+		}
+		killBgProcess(bgAgent);
+	} else if (signalStatus === "question") {
+		bgAgent.status = "waiting";
+		piRef?.sendMessage(
+			{
+				customType: "subagent-bg",
+				content: `[❓ QUESTION from ${bgAgent.id}] ${summary.slice(0, 300)}`,
+				display: true,
+			},
+			{ triggerTurn: true },
+		);
+		// Process stays alive — waiting for steer
+	} else if (signalStatus === "error") {
+		bgAgent.status = "error";
+		bgAgent.endTime = Date.now();
+		piRef?.sendMessage(
+			{
+				customType: "subagent-bg",
+				content: `[❌ ERROR from ${bgAgent.id}] ${summary.slice(0, 300)}`,
+				display: true,
+			},
+			{ triggerTurn: true },
+		);
+		killBgProcess(bgAgent);
+	}
+}
+
+function killBgProcess(bgAgent: BackgroundAgent): void {
+	if (!bgAgent.proc) return;
+	const proc = bgAgent.proc;
+
+	// Track if process has actually exited
+	let exited = false;
+	const onExit = () => {
+		exited = true;
+	};
+	proc.once("exit", onExit);
+
+	try {
+		proc.kill("SIGTERM");
+	} catch {
+		/* already dead */
+		return;
+	}
+
+	setTimeout(() => {
+		if (!exited) {
+			try {
+				proc.kill("SIGKILL");
+			} catch {
+				/* ignore */
+			}
+		}
+		proc.removeListener("exit", onExit);
+	}, 5000);
+}
+
+function cleanupBgAgent(bgAgent: BackgroundAgent): void {
+	if (bgAgent.tmpPromptPath) {
+		try { fs.unlinkSync(bgAgent.tmpPromptPath); } catch { /* ignore */ }
+	}
+	if (bgAgent.tmpPromptDir) {
+		try { fs.rmdirSync(bgAgent.tmpPromptDir); } catch { /* ignore */ }
+	}
+	if (bgAgent.mcpCleanupName && bgAgent.teamName) {
+		try { removeScopedMcpConfig(bgAgent.teamName, bgAgent.mcpCleanupName); } catch { /* ignore */ }
+	}
+}
+
+function trySpawnQueued(): void {
+	const runningCount = [...backgroundAgents.values()].filter(
+		(a) => a.status === "running" || a.status === "waiting",
+	).length;
+
+	if (runningCount >= MAX_BG_CONCURRENCY) return;
+
+	// Find first queued agent
+	for (const bgAgent of backgroundAgents.values()) {
+		if (bgAgent.status === "queued") {
+			launchBackgroundAgent(bgAgent);
+			break; // Only start one at a time; close handler will call trySpawnQueued again
+		}
+	}
+}
+
+function evictCompletedAgents(): void {
+	const completed = [...backgroundAgents.entries()]
+		.filter(([_, a]) => a.status === "done" || a.status === "error" || a.status === "aborted")
+		.sort((a, b) => (a[1].endTime || 0) - (b[1].endTime || 0));
+
+	while (completed.length > MAX_COMPLETED_RETENTION) {
+		const [id] = completed.shift()!;
+		backgroundAgents.delete(id);
+	}
+}
+
+function shutdownAllBackgroundAgents(): void {
+	for (const bgAgent of backgroundAgents.values()) {
+		if (bgAgent.status === "running" || bgAgent.status === "waiting") {
+			bgAgent.status = "aborted";
+			bgAgent.endTime = Date.now();
+			killBgProcess(bgAgent);
+			// Save partial output in team mode
+			if (bgAgent.teamName && bgAgent.saveAs) {
+				const output = getFinalOutput(bgAgent.result.messages);
+				if (output) {
+					try { saveOutput(bgAgent.teamName, bgAgent.saveAs, output); } catch { /* ignore */ }
+				}
+			}
+		} else if (bgAgent.status === "queued") {
+			bgAgent.status = "aborted";
+			bgAgent.endTime = Date.now();
+		}
+	}
+	backgroundAgents.clear();
+}
+
 const TaskItem = Type.Object({
 	agent: Type.String({ description: "Name of the agent to invoke" }),
 	task: Type.String({ description: "Task to delegate to the agent" }),
@@ -729,9 +1173,19 @@ const SubagentParams = Type.Object({
 				"Only these extensions are loaded. Merged with agent's frontmatter extensions. Omit for none.",
 		}),
 	),
+	background: Type.Optional(
+		Type.Boolean({
+			description:
+				"Run the agent in background (non-blocking). Returns immediately with a job ID. " +
+				"Use subagent_status to check progress, subagent_steer to send messages, subagent_stop to kill. " +
+				"Single mode only in V1.",
+			default: false,
+		}),
+	),
 });
 
 export default function (pi: ExtensionAPI) {
+	piRef = pi;
 	// Register team coordination tools (TeamCreate, TaskCreate, SendMessage, etc.)
 	registerCoordinationTools(pi);
 
@@ -784,6 +1238,14 @@ export default function (pi: ExtensionAPI) {
 						},
 					],
 					details: makeDetails("single")([]),
+				};
+			}
+
+			if (params.background && (hasChain || hasTasks)) {
+				return {
+					content: [{ type: "text", text: "background: true is only supported in single mode (V1). Use agent + task." }],
+					details: makeDetails(hasChain ? "chain" : "parallel")([]),
+					isError: true,
 				};
 			}
 
@@ -960,6 +1422,95 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			if (params.agent && params.task) {
+				// ── Background mode ──
+				if (params.background) {
+					if (!params.agent || !params.task) {
+						return {
+							content: [{ type: "text", text: "background: true requires single mode (agent + task)." }],
+							details: makeDetails("single")([]),
+							isError: true,
+						};
+					}
+
+					const taskText = teamName ? buildTeamTask(teamName, params.task) : params.task;
+					const agentConfig = agents.find((a) => a.name === params.agent);
+					if (!agentConfig) {
+						const available = agents.map((a) => `"${a.name}"`).join(", ") || "none";
+						return {
+							content: [{ type: "text", text: `Unknown agent: "${params.agent}". Available: ${available}` }],
+							details: makeDetails("single")([]),
+							isError: true,
+						};
+					}
+
+					const jobId = generateBgId(params.agent, params.saveAs);
+					const saveAs = params.saveAs || params.agent;
+
+					// Build spawn args (same as runSingleAgent but --mode rpc)
+					const spawnArgs = buildBgSpawnArgs(agentConfig, params.mcps, params.extensions, teamName);
+
+					// Check concurrency
+					const runningCount = [...backgroundAgents.values()].filter(
+						(a) => a.status === "running" || a.status === "waiting",
+					).length;
+
+					const bgAgent: BackgroundAgent = {
+						id: jobId,
+						agent: params.agent,
+						task: taskText,
+						proc: null,
+						result: {
+							agent: params.agent,
+							agentSource: agentConfig.source,
+							task: taskText,
+							exitCode: -1,
+							messages: [],
+							stderr: "",
+							usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
+							startTime: Date.now(),
+						},
+						status: runningCount >= MAX_BG_CONCURRENCY ? "queued" : "running",
+						startTime: Date.now(),
+						cwd: params.cwd ?? ctx.cwd,
+						agentConfig,
+						spawnArgs,
+						teamName,
+						saveAs,
+						extensions: params.extensions,
+						mcps: params.mcps,
+					};
+
+					backgroundAgents.set(jobId, bgAgent);
+					evictCompletedAgents();
+
+					if (bgAgent.status === "running") {
+						launchBackgroundAgent(bgAgent);
+					} else {
+						const queuePos = [...backgroundAgents.values()].filter((a) => a.status === "queued").length;
+						piRef?.sendMessage(
+							{
+								customType: "subagent-bg",
+								content: `[⏳ QUEUED ${jobId}] Position ${queuePos} — waiting for a slot`,
+								display: true,
+							},
+							{ triggerTurn: false },
+						);
+					}
+
+					return {
+						content: [
+							{
+								type: "text",
+								text:
+									bgAgent.status === "queued"
+										? `Background agent queued: ${jobId} (${bgAgent.agent})\nStatus: queued — ${runningCount}/${MAX_BG_CONCURRENCY} slots in use\nUse subagent_status(id: "${jobId}") to check progress.`
+										: `Background agent started: ${jobId} (${bgAgent.agent})\nStatus: running\nUse subagent_status(id: "${jobId}") to check progress.`,
+							},
+						],
+						details: makeDetails("single")([bgAgent.result]),
+					};
+				}
+
 				// Team mode: expand output placeholders and prepend shared context
 				const taskText = teamName ? buildTeamTask(teamName, params.task) : params.task;
 				const outputName = params.saveAs || params.agent;
@@ -1345,6 +1896,225 @@ export default function (pi: ExtensionAPI) {
 			const text = result.content[0];
 			return new Text(text?.type === "text" ? text.text : "(no output)", 0, 0);
 		},
+	});
+
+	pi.registerTool({
+		name: "subagent_steer",
+		label: "Steer Background Agent",
+		description: "Send a message to a running/waiting background agent.",
+		parameters: Type.Object({
+			id: Type.String({ description: "Background agent job ID" }),
+			message: Type.String({ description: "Message to send to the agent" }),
+			interrupt: Type.Optional(
+				Type.Boolean({ description: "Abort current turn before sending (default: false)", default: false }),
+			),
+		}),
+		async execute(_toolCallId, params) {
+			const bgAgent = backgroundAgents.get(params.id);
+			if (!bgAgent) {
+				return {
+					content: [{ type: "text", text: `No background agent found with id "${params.id}"` }],
+					isError: true,
+				};
+			}
+			if (bgAgent.status !== "running" && bgAgent.status !== "waiting") {
+				return {
+					content: [{ type: "text", text: `Agent "${params.id}" is ${bgAgent.status}, cannot steer.` }],
+					isError: true,
+				};
+			}
+			if (!bgAgent.proc || bgAgent.proc.killed) {
+				return {
+					content: [{ type: "text", text: `Agent "${params.id}" process is not alive.` }],
+					isError: true,
+				};
+			}
+
+			if (params.interrupt) {
+				bgAgent.proc.stdin!.write(JSON.stringify({ type: "abort" }) + "\n");
+				// Brief pause before sending new prompt
+				await new Promise((r) => setTimeout(r, 500));
+			}
+
+			const steerMsg = bgAgent.status === "waiting"
+				? JSON.stringify({ type: "prompt", message: params.message }) + "\n"
+				: JSON.stringify({ type: "steer", message: params.message }) + "\n";
+
+			bgAgent.proc.stdin!.write(steerMsg);
+			if (bgAgent.status === "waiting") bgAgent.status = "running";
+
+			return {
+				content: [
+					{
+						type: "text",
+						text: `Steered "${params.id}": ${params.interrupt ? "(interrupted) " : ""}${params.message.slice(0, 100)}`,
+					},
+				],
+			};
+		},
+		renderResult(result) {
+			const text = result.content[0];
+			return new Text(text?.type === "text" ? text.text : "", 0, 0);
+		},
+	});
+
+	pi.registerTool({
+		name: "subagent_status",
+		label: "Background Agent Status",
+		description: "Check status of background agents. Omit id for all agents.",
+		parameters: Type.Object({
+			id: Type.Optional(Type.String({ description: "Specific job ID, or omit for all" })),
+		}),
+		async execute(_toolCallId, params) {
+			if (params.id) {
+				const bgAgent = backgroundAgents.get(params.id);
+				if (!bgAgent) {
+					return {
+						content: [{ type: "text", text: `No background agent found with id "${params.id}"` }],
+						isError: true,
+					};
+				}
+				const elapsedMs = (bgAgent.endTime ?? Date.now()) - bgAgent.startTime;
+				const elapsed = formatDuration(elapsedMs);
+				const turns = bgAgent.result.usage.turns;
+				const lastTools = bgAgent.result.messages
+					.filter((m) => m.role === "assistant")
+					.flatMap((m) => m.content.filter((p: any) => p.type === "toolCall").map((p: any) => p.name))
+					.slice(-5);
+				const usageStr = formatUsageStats(bgAgent.result.usage, bgAgent.result.model, {
+					provider: bgAgent.result.provider,
+					elapsedMs,
+				});
+
+				return {
+					content: [
+						{
+							type: "text",
+							text: [
+								`Agent: ${bgAgent.id} (${bgAgent.agent})`,
+								`Status: ${bgAgent.status}`,
+								`Elapsed: ${elapsed}`,
+								`Turns: ${turns}`,
+								lastTools.length > 0 ? `Recent tools: ${lastTools.join(", ")}` : null,
+								usageStr ? `Usage: ${usageStr}` : null,
+								`Task: ${bgAgent.task.slice(0, 150)}`,
+							]
+								.filter(Boolean)
+								.join("\n"),
+						},
+					],
+				};
+			}
+
+			// All agents summary
+			const entries = [...backgroundAgents.values()];
+			if (entries.length === 0) {
+				return { content: [{ type: "text", text: "No background agents." }] };
+			}
+
+			const queuedEntries = entries.filter((a) => a.status === "queued");
+			const queuePositions = new Map(queuedEntries.map((a, index) => [a.id, index + 1]));
+			const lines = entries.map((a) => {
+				const elapsed = formatDuration((a.endTime ?? Date.now()) - a.startTime);
+				const icon =
+					a.status === "running" ? "⏳" :
+					a.status === "waiting" ? "❓" :
+					a.status === "queued" ? "📋" :
+					a.status === "done" ? "✅" :
+					a.status === "error" ? "❌" :
+					"🛑";
+				const queueInfo = a.status === "queued" ? ` (position ${queuePositions.get(a.id)})` : "";
+				return `${icon} ${a.id} (${a.agent}) — ${a.status}${queueInfo} — ${elapsed} — ${a.result.usage.turns} turns`;
+			});
+
+			const running = entries.filter((a) => a.status === "running" || a.status === "waiting").length;
+			const queued = entries.filter((a) => a.status === "queued").length;
+
+			return {
+				content: [
+					{
+						type: "text",
+						text: `Background agents (${running} running, ${queued} queued):\n${lines.join("\n")}`,
+					},
+				],
+			};
+		},
+		renderResult(result) {
+			const text = result.content[0];
+			return new Text(text?.type === "text" ? text.text : "", 0, 0);
+		},
+	});
+
+	pi.registerTool({
+		name: "subagent_stop",
+		label: "Stop Background Agent",
+		description: "Kill a running background agent or cancel a queued one.",
+		parameters: Type.Object({
+			id: Type.String({ description: "Background agent job ID" }),
+		}),
+		async execute(_toolCallId, params) {
+			const bgAgent = backgroundAgents.get(params.id);
+			if (!bgAgent) {
+				return {
+					content: [{ type: "text", text: `No background agent found with id "${params.id}"` }],
+					isError: true,
+				};
+			}
+
+			if (bgAgent.status === "done" || bgAgent.status === "error" || bgAgent.status === "aborted") {
+				return {
+					content: [{ type: "text", text: `Agent "${params.id}" already ${bgAgent.status}.` }],
+				};
+			}
+
+			const wasQueued = bgAgent.status === "queued";
+			bgAgent.status = "aborted";
+			bgAgent.endTime = Date.now();
+
+			if (!wasQueued) {
+				killBgProcess(bgAgent);
+			}
+
+			// Save partial output in team mode
+			if (bgAgent.teamName && bgAgent.saveAs) {
+				const output = getFinalOutput(bgAgent.result.messages);
+				if (output) {
+					try { saveOutput(bgAgent.teamName, bgAgent.saveAs, output); } catch { /* ignore */ }
+					bgAgent.result.savedAs = bgAgent.saveAs;
+				}
+			}
+
+			piRef?.sendMessage(
+				{
+					customType: "subagent-bg",
+					content: `[🛑 ABORTED ${bgAgent.id}]`,
+					display: true,
+				},
+				{ triggerTurn: false },
+			);
+
+			if (wasQueued) {
+				trySpawnQueued();
+			}
+
+			return {
+				content: [
+					{
+						type: "text",
+						text: `Stopped "${params.id}". ${bgAgent.result.usage.turns} turns completed before abort.`,
+					},
+				],
+			};
+		},
+		renderResult(result) {
+			const text = result.content[0];
+			return new Text(text?.type === "text" ? text.text : "", 0, 0);
+		},
+	});
+
+	// ── Session cleanup ──────────────────────────────────────────────
+	pi.on("session_shutdown", async () => {
+		shutdownAllBackgroundAgents();
 	});
 
 	// ── Team commands ────────────────────────────────────────────────
