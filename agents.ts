@@ -13,6 +13,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { getAgentDir, parseFrontmatter } from "@mariozechner/pi-coding-agent";
+import { normalizeParametersSchema } from "./parameters.js";
 
 export type AgentScope = "user" | "project" | "both";
 
@@ -25,14 +26,37 @@ export interface AgentConfig {
 	systemPrompt: string;
 	source: "bundled" | "user" | "project";
 	filePath: string;
+	parameters?: Record<string, unknown>;
+	inputInstructions?: string;
+	allowFreeform?: boolean;
+	allowRuntimeTools?: boolean;
 }
 
 export interface AgentDiscoveryResult {
 	agents: AgentConfig[];
 	projectAgentsDir: string | null;
+	diagnostics: string[];
 }
 
-function loadAgentsFromDir(dir: string, source: AgentConfig["source"]): AgentConfig[] {
+function asString(value: unknown): string | undefined {
+	return typeof value === "string" ? value : undefined;
+}
+
+function asBoolean(value: unknown): boolean | undefined {
+	return typeof value === "boolean" ? value : undefined;
+}
+
+function asStringList(value: unknown): string[] | undefined {
+	if (Array.isArray(value)) {
+		return value.map(String);
+	}
+	if (typeof value === "string") {
+		return value.split(",").map((s) => s.trim()).filter(Boolean);
+	}
+	return undefined;
+}
+
+function loadAgentsFromDir(dir: string, source: AgentConfig["source"], diagnostics: string[]): AgentConfig[] {
 	const agents: AgentConfig[] = [];
 
 	if (!fs.existsSync(dir)) return agents;
@@ -56,30 +80,45 @@ function loadAgentsFromDir(dir: string, source: AgentConfig["source"]): AgentCon
 			continue;
 		}
 
-		const { frontmatter, body } = parseFrontmatter<Record<string, string>>(content);
+		try {
+			const { frontmatter, body } = parseFrontmatter<Record<string, unknown>>(content);
 
-		if (!frontmatter.name || !frontmatter.description) continue;
+			const name = asString(frontmatter.name);
+			const description = asString(frontmatter.description);
 
-		const tools = frontmatter.tools
-			?.split(",")
-			.map((t: string) => t.trim())
-			.filter(Boolean);
+			if (!name || !description) continue;
 
-		const extensions = frontmatter.extensions
-			?.split(",")
-			.map((t: string) => t.trim())
-			.filter(Boolean);
+			let parametersSchema: Record<string, unknown> | undefined;
+			if (frontmatter.parameters !== undefined) {
+				const { schema, error } = normalizeParametersSchema(frontmatter.parameters);
+				if (error) {
+					diagnostics.push(`Agent '${name}' in ${source} skipped due to invalid parameters: ${error}`);
+					continue;
+				}
+				parametersSchema = schema;
+			}
 
-		agents.push({
-			name: frontmatter.name,
-			description: frontmatter.description,
-			tools: tools && tools.length > 0 ? tools : undefined,
-			extensions: extensions && extensions.length > 0 ? extensions : undefined,
-			model: frontmatter.model,
-			systemPrompt: body,
-			source,
-			filePath,
-		});
+			const tools = asStringList(frontmatter.tools);
+			const extensions = asStringList(frontmatter.extensions);
+
+			agents.push({
+				name,
+				description,
+				tools: tools && tools.length > 0 ? tools : undefined,
+				extensions: extensions && extensions.length > 0 ? extensions : undefined,
+				model: asString(frontmatter.model),
+				systemPrompt: body,
+				source,
+				filePath,
+				parameters: parametersSchema,
+				inputInstructions: asString(frontmatter.inputInstructions),
+				allowFreeform: asBoolean(frontmatter.allowFreeform),
+				allowRuntimeTools: asBoolean(frontmatter.allowRuntimeTools),
+			});
+		} catch (err: any) {
+			diagnostics.push(`Failed to parse agent file ${filePath}: ${err.message}`);
+			continue;
+		}
 	}
 
 	return agents;
@@ -128,10 +167,12 @@ export function discoverAgents(cwd: string, scope: AgentScope): AgentDiscoveryRe
 	const projectAgentsDir = findNearestProjectAgentsDir(cwd);
 	const bundledDir = getBundledAgentsDir();
 
+	const diagnostics: string[] = [];
+
 	// Load from all three sources
-	const bundledAgents = loadAgentsFromDir(bundledDir, "bundled");
-	const userAgents = scope === "project" ? [] : loadAgentsFromDir(userDir, "user");
-	const projectAgents = scope === "user" || !projectAgentsDir ? [] : loadAgentsFromDir(projectAgentsDir, "project");
+	const bundledAgents = loadAgentsFromDir(bundledDir, "bundled", diagnostics);
+	const userAgents = scope === "project" ? [] : loadAgentsFromDir(userDir, "user", diagnostics);
+	const projectAgents = scope === "user" || !projectAgentsDir ? [] : loadAgentsFromDir(projectAgentsDir, "project", diagnostics);
 
 	// Merge with priority: bundled < user < project
 	const agentMap = new Map<string, AgentConfig>();
@@ -146,7 +187,7 @@ export function discoverAgents(cwd: string, scope: AgentScope): AgentDiscoveryRe
 		for (const agent of projectAgents) agentMap.set(agent.name, agent);
 	}
 
-	return { agents: Array.from(agentMap.values()), projectAgentsDir };
+	return { agents: Array.from(agentMap.values()), projectAgentsDir, diagnostics };
 }
 
 export function formatAgentList(agents: AgentConfig[], maxItems: number): { text: string; remaining: number } {

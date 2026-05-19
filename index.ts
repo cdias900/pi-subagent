@@ -26,7 +26,16 @@ import { Type } from "@sinclair/typebox";
 import { type AgentConfig, type AgentScope, discoverAgents } from "./agents.js";
 import { registerCoordinationTools } from "./coordination.js";
 import {
-	buildTeamTask,
+	buildCompactAgentInfo,
+	buildFullAgentContract,
+	formatJson,
+} from "./parameters.js";
+import {
+	type AgentInvocation,
+	resolveInvocation,
+	displayInputSummary,
+} from "./invocation.js";
+import {
 	deleteTeam,
 	ensureTeamDir,
 	getTeamDir,
@@ -369,6 +378,8 @@ interface SingleResult {
 	step?: number;
 	savedAs?: string;
 	startTime: number;
+	promptKind?: "task" | "input";
+	input?: unknown;
 }
 
 interface SubagentDetails {
@@ -383,6 +394,9 @@ interface BackgroundAgent {
 	id: string;
 	agent: string;
 	task: string;
+	prompt: string;
+	promptKind: "task" | "input";
+	input?: unknown;
 	proc: ChildProcess | null;
 	result: SingleResult;
 	status: "queued" | "running" | "waiting" | "done" | "error" | "aborted";
@@ -408,7 +422,8 @@ const bgAutoCounter = new Map<string, number>();
 // ── V2: Background Groups ──────────────────────────────────────────
 interface ChainStepDef {
 	agent: string;
-	task: string;
+	task?: string;
+	input?: unknown;
 	cwd?: string;
 	saveAs?: string;
 	mcps?: string[];
@@ -428,6 +443,9 @@ interface BackgroundGroup {
 	notifyPerTask: boolean;
 	teamName?: string;
 	saveAs?: string;
+	agents?: AgentConfig[];
+	agentScope?: AgentScope;
+	defaultCwd?: string;
 }
 
 const backgroundGroups = new Map<string, BackgroundGroup>();
@@ -548,34 +566,19 @@ type OnUpdateCallback = (partial: AgentToolResult<SubagentDetails>) => void;
 
 async function runSingleAgent(
 	defaultCwd: string,
-	agents: AgentConfig[],
-	agentName: string,
-	task: string,
-	cwd: string | undefined,
-	step: number | undefined,
+	invocation: AgentInvocation,
 	signal: AbortSignal | undefined,
 	onUpdate: OnUpdateCallback | undefined,
 	makeDetails: (results: SingleResult[]) => SubagentDetails,
-	mcps?: string[],
-	runtimeExtensions?: string[],
-	teamName?: string,
 ): Promise<SingleResult> {
-	const agent = agents.find((a) => a.name === agentName);
-
-	if (!agent) {
-		const available = agents.map((a) => `"${a.name}"`).join(", ") || "none";
-		return {
-			agent: agentName,
-			agentSource: "unknown",
-			task,
-			exitCode: 1,
-			messages: [],
-			stderr: `Unknown agent: "${agentName}". Available agents: ${available}.`,
-			usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
-			step,
-			startTime: Date.now(),
-		};
-	}
+	const agent = invocation.agent;
+	const agentName = invocation.agentName;
+	const task = invocation.display;
+	const cwd = invocation.cwd;
+	const step = invocation.step;
+	const mcps = invocation.mcps;
+	const runtimeExtensions = invocation.extensions;
+	const teamName = invocation.teamName;
 
 	const args: string[] = ["--mode", "json", "-p", "--no-session", "--no-extensions"];
 
@@ -617,6 +620,8 @@ async function runSingleAgent(
 		agent: agentName,
 		agentSource: agent.source,
 		task,
+		promptKind: invocation.promptKind,
+		input: invocation.input,
 		exitCode: 0,
 		messages: [],
 		stderr: "",
@@ -646,7 +651,7 @@ async function runSingleAgent(
 			args.push("--append-system-prompt", tmpPromptPath);
 		}
 
-		args.push(`Task: ${task}`);
+		args.push(invocation.prompt);
 		let wasAborted = false;
 
 		const exitCode = await new Promise<number>((resolve) => {
@@ -1005,7 +1010,7 @@ function launchBackgroundAgent(bgAgent: BackgroundAgent): void {
 	});
 
 	// Send initial prompt via stdin
-	const prompt = JSON.stringify({ type: "prompt", message: `Task: ${bgAgent.task}` }) + "\n";
+	const prompt = JSON.stringify({ type: "prompt", message: bgAgent.prompt }) + "\n";
 	proc.stdin!.write(prompt);
 
 	if (!bgAgent.groupId) {
@@ -1182,7 +1187,7 @@ function checkParallelGroupCompletion(group: BackgroundGroup): void {
 }
 
 function advanceChain(group: BackgroundGroup): void {
-	if (!group.chainSteps || group.currentStepIndex === undefined) return;
+	if (!group.chainSteps || group.currentStepIndex === undefined || !group.agents) return;
 
 	const nextIndex = group.currentStepIndex + 1;
 	if (nextIndex >= group.chainSteps.length) {
@@ -1221,35 +1226,46 @@ function advanceChain(group: BackgroundGroup): void {
 
 	group.currentStepIndex = nextIndex;
 	const stepDef = group.chainSteps[nextIndex];
-	const resolvedTask = stepDef.task.replace(/\{previous\}/g, group.previousOutput || "(no output from previous step)");
-	const taskText = group.teamName ? buildTeamTask(group.teamName, resolvedTask) : resolvedTask;
 
-	const stepCwd = stepDef.cwd ?? process.cwd();
-	const discovered = discoverAgents(stepCwd, "both");
-	const agentConfig = discovered.agents.find((a) => a.name === stepDef.agent);
-	if (!agentConfig) {
+	let invocation: AgentInvocation;
+	try {
+		// Use stored agents, or fallback to discovery (ideally we just use group.agents)
+		invocation = resolveInvocation({
+			agents: group.agents,
+			spec: stepDef,
+			teamName: group.teamName,
+			previousOutput: group.previousOutput || "",
+			step: nextIndex + 1,
+		});
+	} catch (e: any) {
 		group.status = "error";
 		group.endTime = Date.now();
 		piRef?.sendMessage(
-			{ customType: "subagent-bg", content: `[❌ ${group.groupId}] Step ${nextIndex + 1}/${group.chainSteps.length} failed: unknown agent "${stepDef.agent}"`, display: true },
+			{ customType: "subagent-bg", content: `[❌ ${group.groupId}] Step ${nextIndex + 1}/${group.chainSteps.length} failed: ${e.message}`, display: true },
 			{ triggerTurn: true },
 		);
 		updateBgWidget();
 		return;
 	}
 
+	const agentConfig = invocation.agent;
 	const memberId = generateMemberId(group.groupId, stepDef.agent, group.chainSteps.map((s) => s.agent));
 	const spawnArgs = buildBgSpawnArgs(agentConfig, stepDef.mcps, stepDef.extensions, group.teamName);
 
 	const bgAgent: BackgroundAgent = {
 		id: memberId,
 		agent: stepDef.agent,
-		task: taskText,
+		task: invocation.display,
+		prompt: invocation.prompt,
+		promptKind: invocation.promptKind,
+		input: invocation.input,
 		proc: null,
 		result: {
 			agent: stepDef.agent,
 			agentSource: agentConfig.source,
-			task: taskText,
+			task: invocation.display,
+			promptKind: invocation.promptKind,
+			input: invocation.input,
 			exitCode: -1,
 			messages: [],
 			stderr: "",
@@ -1258,7 +1274,7 @@ function advanceChain(group: BackgroundGroup): void {
 		},
 		status: "queued",
 		startTime: Date.now(),
-		cwd: stepDef.cwd ?? process.cwd(),
+		cwd: stepDef.cwd ?? group.defaultCwd ?? process.cwd(),
 		agentConfig,
 		spawnArgs,
 		teamName: group.teamName,
@@ -1298,10 +1314,11 @@ function evictCompletedGroups(): void {
 }
 
 function launchBackgroundParallel(
-	params: { tasks: Array<{ agent: string; task: string; cwd?: string; saveAs?: string; mcps?: string[]; extensions?: string[] }>; saveAs?: string; notifyPerTask?: boolean; background?: boolean },
+	params: { tasks: Array<{ agent: string; task?: string; input?: unknown; cwd?: string; saveAs?: string; mcps?: string[]; extensions?: string[] }>; saveAs?: string; notifyPerTask?: boolean; background?: boolean },
 	agents: AgentConfig[],
 	defaultCwd: string,
 	teamName?: string,
+	invocations?: AgentInvocation[],
 ): { groupId: string; memberIds: string[]; queuedCount: number } {
 	const groupId = generateGroupId("parallel", params.saveAs);
 	const notifyPerTask = params.notifyPerTask !== false;
@@ -1321,13 +1338,13 @@ function launchBackgroundParallel(
 
 	let queuedCount = 0;
 
-	for (const t of params.tasks) {
-		const agentConfig = agents.find((a) => a.name === t.agent);
-		if (!agentConfig) continue;
+	for (let i = 0; i < params.tasks.length; i++) {
+		const t = params.tasks[i];
+		const invocation = invocations ? invocations[i] : resolveInvocation({ agents, spec: t, teamName });
+		const agentConfig = invocation.agent;
 
 		const memberId = generateMemberId(groupId, t.agent, allAgentNames);
-		const taskText = teamName ? buildTeamTask(teamName, t.task) : t.task;
-		const spawnArgs = buildBgSpawnArgs(agentConfig, t.mcps, t.extensions, teamName);
+		const spawnArgs = buildBgSpawnArgs(agentConfig, invocation.mcps, invocation.extensions, teamName);
 
 		const runningCount = [...backgroundAgents.values()].filter((a) => a.status === "running" || a.status === "waiting").length;
 		const initialStatus = runningCount >= MAX_BG_CONCURRENCY ? "queued" as const : "running" as const;
@@ -1336,12 +1353,17 @@ function launchBackgroundParallel(
 		const bgAgent: BackgroundAgent = {
 			id: memberId,
 			agent: t.agent,
-			task: taskText,
+			task: invocation.display,
+			prompt: invocation.prompt,
+			promptKind: invocation.promptKind,
+			input: invocation.input,
 			proc: null,
 			result: {
 				agent: t.agent,
 				agentSource: agentConfig.source,
-				task: taskText,
+				task: invocation.display,
+				promptKind: invocation.promptKind,
+				input: invocation.input,
 				exitCode: -1,
 				messages: [],
 				stderr: "",
@@ -1382,10 +1404,11 @@ function launchBackgroundParallel(
 }
 
 function launchBackgroundChain(
-	params: { chain: Array<{ agent: string; task: string; cwd?: string; saveAs?: string; mcps?: string[]; extensions?: string[] }>; saveAs?: string; notifyPerTask?: boolean; background?: boolean },
+	params: { chain: Array<{ agent: string; task?: string; input?: unknown; cwd?: string; saveAs?: string; mcps?: string[]; extensions?: string[] }>; saveAs?: string; notifyPerTask?: boolean; background?: boolean },
 	agents: AgentConfig[],
 	defaultCwd: string,
 	teamName?: string,
+	firstInvocation?: AgentInvocation,
 ): { groupId: string; firstMemberId: string } {
 	const groupId = generateGroupId("chain", params.saveAs);
 	const notifyPerTask = params.notifyPerTask !== false;
@@ -1400,6 +1423,7 @@ function launchBackgroundChain(
 		chainSteps: params.chain.map((s) => ({
 			agent: s.agent,
 			task: s.task,
+			input: s.input,
 			cwd: s.cwd,
 			saveAs: s.saveAs,
 			mcps: s.mcps,
@@ -1409,20 +1433,17 @@ function launchBackgroundChain(
 		notifyPerTask,
 		teamName,
 		saveAs: params.saveAs,
+		agents, // store for advanceChain
+		defaultCwd,
 	};
 	backgroundGroups.set(groupId, group);
 
 	const firstStep = params.chain[0];
-	const agentConfig = agents.find((a) => a.name === firstStep.agent);
-	if (!agentConfig) {
-		group.status = "error";
-		group.endTime = Date.now();
-		return { groupId, firstMemberId: "" };
-	}
+	const invocation = firstInvocation || resolveInvocation({ agents, spec: firstStep, teamName });
+	const agentConfig = invocation.agent;
 
 	const memberId = generateMemberId(groupId, firstStep.agent, allAgentNames);
-	const taskText = teamName ? buildTeamTask(teamName, firstStep.task) : firstStep.task;
-	const spawnArgs = buildBgSpawnArgs(agentConfig, firstStep.mcps, firstStep.extensions, teamName);
+	const spawnArgs = buildBgSpawnArgs(agentConfig, invocation.mcps, invocation.extensions, teamName);
 
 	const runningCount = [...backgroundAgents.values()].filter((a) => a.status === "running" || a.status === "waiting").length;
 	const initialStatus = runningCount >= MAX_BG_CONCURRENCY ? "queued" as const : "running" as const;
@@ -1430,12 +1451,17 @@ function launchBackgroundChain(
 	const bgAgent: BackgroundAgent = {
 		id: memberId,
 		agent: firstStep.agent,
-		task: taskText,
+		task: invocation.display,
+		prompt: invocation.prompt,
+		promptKind: invocation.promptKind,
+		input: invocation.input,
 		proc: null,
 		result: {
 			agent: firstStep.agent,
 			agentSource: agentConfig.source,
-			task: taskText,
+			task: invocation.display,
+			promptKind: invocation.promptKind,
+			input: invocation.input,
 			exitCode: -1,
 			messages: [],
 			stderr: "",
@@ -1585,7 +1611,8 @@ function shutdownAllBackgroundAgents(): void {
 
 const TaskItem = Type.Object({
 	agent: Type.String({ description: "Name of the agent to invoke" }),
-	task: Type.String({ description: "Task to delegate to the agent" }),
+	task: Type.Optional(Type.String({ description: "Task to delegate to the agent" })),
+	input: Type.Optional(Type.Unknown({ description: "Structured input for parameterized agents" })),
 	cwd: Type.Optional(Type.String({ description: "Working directory for the agent process" })),
 	saveAs: Type.Optional(
 		Type.String({ description: "Name for saved output in team mode (default: agent name, or agent-N for parallel)" }),
@@ -1608,7 +1635,8 @@ const TaskItem = Type.Object({
 
 const ChainItem = Type.Object({
 	agent: Type.String({ description: "Name of the agent to invoke" }),
-	task: Type.String({ description: "Task with optional {previous} placeholder for prior output" }),
+	task: Type.Optional(Type.String({ description: "Task with optional {previous} placeholder for prior output" })),
+	input: Type.Optional(Type.Unknown({ description: "Structured input for parameterized agents. String values support {previous}." })),
 	cwd: Type.Optional(Type.String({ description: "Working directory for the agent process" })),
 	saveAs: Type.Optional(
 		Type.String({ description: "Name for saved output in team mode (default: agent name)" }),
@@ -1634,11 +1662,23 @@ const AgentScopeSchema = StringEnum(["user", "project", "both"] as const, {
 	default: "user",
 });
 
+const AgentDiscoveryParams = Type.Object({
+	agentScope: Type.Optional(AgentScopeSchema),
+	cwd: Type.Optional(Type.String({ description: "Directory used to discover project-local .pi/agents. Defaults to current cwd." })),
+});
+
+const DescribeAgentParams = Type.Object({
+	agent: Type.String({ description: "Agent name to describe" }),
+	agentScope: Type.Optional(AgentScopeSchema),
+	cwd: Type.Optional(Type.String({ description: "Directory used to discover project-local .pi/agents. Defaults to current cwd." })),
+});
+
 const SubagentParams = Type.Object({
 	agent: Type.Optional(Type.String({ description: "Name of the agent to invoke (for single mode)" })),
 	task: Type.Optional(Type.String({ description: "Task to delegate (for single mode)" })),
-	tasks: Type.Optional(Type.Array(TaskItem, { description: "Array of {agent, task} for parallel execution" })),
-	chain: Type.Optional(Type.Array(ChainItem, { description: "Array of {agent, task} for sequential execution" })),
+	input: Type.Optional(Type.Unknown({ description: "Structured input for single mode" })),
+	tasks: Type.Optional(Type.Array(TaskItem, { description: "Array of {agent, task/input} for parallel execution" })),
+	chain: Type.Optional(Type.Array(ChainItem, { description: "Array of {agent, task/input} for sequential execution" })),
 	agentScope: Type.Optional(AgentScopeSchema),
 	confirmProjectAgents: Type.Optional(
 		Type.Boolean({ description: "Prompt before running project-local agents. Default: true.", default: true }),
@@ -1673,7 +1713,7 @@ const SubagentParams = Type.Object({
 			description:
 				"Run the agent in background (non-blocking). Returns immediately with a job ID. " +
 				"Use subagent_status to check progress, subagent_steer to send messages, subagent_stop to kill. " +
-				"Single mode only in V1.",
+				"Supports single, parallel, and chain modes.",
 			default: false,
 		}),
 	),
@@ -1698,15 +1738,66 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.registerTool({
+		name: "list_subagents",
+		label: "List Subagents",
+		description: "Discover available subagents compactly. Use agentScope: 'both' to see project-local agents.",
+		parameters: AgentDiscoveryParams,
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			const scope = params.agentScope ?? "user";
+			const discovery = discoverAgents(params.cwd ?? ctx.cwd, scope);
+
+			const agents = [...discovery.agents].sort((a, b) => a.name.localeCompare(b.name));
+
+			const compactAgents = agents.map(buildCompactAgentInfo);
+			const payload = {
+				agentScope: scope,
+				count: compactAgents.length,
+				agents: compactAgents,
+				diagnostics: discovery.diagnostics,
+			};
+
+			return {
+				content: [{ type: "text", text: formatJson(payload) }],
+				details: payload,
+			};
+		},
+	});
+
+	pi.registerTool({
+		name: "describe_agent",
+		label: "Describe Agent",
+		description: "Get the full contract for a specific parameterized or freeform agent, including its JSON Schema.",
+		parameters: DescribeAgentParams,
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			const scope = params.agentScope ?? "user";
+			const discovery = discoverAgents(params.cwd ?? ctx.cwd, scope);
+
+			const agent = discovery.agents.find(a => a.name === params.agent);
+			if (!agent) {
+				const available = discovery.agents.map(a => a.name).join(", ");
+				const hint = scope !== "both" ? ` Try list_subagents({ agentScope: "both" }) if this may be project-local.` : "";
+				throw new Error(`Agent "${params.agent}" not found.${hint} Available agents: ${available}`);
+			}
+
+			const payload = buildFullAgentContract(agent);
+			return {
+				content: [{ type: "text", text: formatJson(payload) }],
+				details: payload,
+			};
+		},
+	});
+
+	pi.registerTool({
 		name: "subagent",
 		label: "Subagent",
 		description: [
 			"Delegate tasks to specialized subagents with isolated context.",
-			"Modes: single (agent + task), parallel (tasks array), chain (sequential with {previous} placeholder).",
+			"Modes: single (agent + task/input), parallel (tasks array), chain (sequential with {previous} placeholder).",
 			'Default agent scope is "user" (from ~/.pi/agent/agents).',
 			'To enable project-local agents in .pi/agents, set agentScope: "both" (or "project").',
 			"Team mode: set team param to enable shared context + named outputs. Use {output:name} in tasks to reference previous agent outputs.",
 			"Manage teams: /team new|info|outputs|delete <name>.",
+			"For parameterized agents, use list_subagents() and describe_agent() to get the schema, and pass the data via the `input` parameter.",
 		].join(" "),
 		parameters: SubagentParams,
 
@@ -1720,7 +1811,7 @@ export default function (pi: ExtensionAPI) {
 
 			const hasChain = (params.chain?.length ?? 0) > 0;
 			const hasTasks = (params.tasks?.length ?? 0) > 0;
-			const hasSingle = Boolean(params.agent && params.task);
+			const hasSingle = Boolean(params.agent && (params.task !== undefined || params.input !== undefined));
 			const modeCount = Number(hasChain) + Number(hasTasks) + Number(hasSingle);
 
 			// Ensure team directory exists if team mode is active
@@ -1737,23 +1828,57 @@ export default function (pi: ExtensionAPI) {
 				});
 
 			if (modeCount !== 1) {
-				const available = agents.map((a) => `${a.name} (${a.source})`).join(", ") || "none";
-				return {
-					content: [
-						{
-							type: "text",
-							text: `Invalid parameters. Provide exactly one mode.\nAvailable agents: ${available}`,
-						},
-					],
-					details: makeDetails("single")([]),
-				};
+				throw new Error(`Invalid parameters. Provide exactly one mode (single agent, chain, or tasks).`);
+			}
+
+			// Preflight confirm project agents
+			if ((agentScope === "project" || agentScope === "both") && confirmProjectAgents) {
+				const requestedAgentNames = new Set<string>();
+				if (params.chain) for (const step of params.chain) requestedAgentNames.add(step.agent);
+				if (params.tasks) for (const t of params.tasks) requestedAgentNames.add(t.agent);
+				if (params.agent) requestedAgentNames.add(params.agent);
+
+				const projectAgentsRequested = Array.from(requestedAgentNames)
+					.map((name) => agents.find((a) => a.name === name))
+					.filter((a): a is AgentConfig => a?.source === "project");
+
+				if (projectAgentsRequested.length > 0) {
+					const canPromptLocally =
+						ctx.hasUI &&
+						process.stdin.isTTY === true &&
+						process.stdout.isTTY === true &&
+						process.stdin.isRaw === true;
+
+					if (!canPromptLocally) {
+						throw new Error(`Execution of project-local agents requires explicit opt-in in headless/API mode.\n\nAgents: ${projectAgentsRequested.map(a => a.name).join(", ")}\n\nProject-local agents require local TUI confirmation or explicit caller opt-in.\nIn RPC/API/headless contexts, the caller must run its own confirmation and pass\n\`confirmProjectAgents: false\`. ctx.hasUI is not treated as human consent because\nPi's RPC UI protocol can be auto-answered by clients.`);
+					}
+					const names = projectAgentsRequested.map((a) => a.name).join(", ");
+					const dir = discovery.projectAgentsDir ?? "(unknown)";
+					const ok = await ctx.ui.confirm(
+						"Run project-local agents?",
+						`Agents: ${names}\nSource: ${dir}\n\nProject agents are repo-controlled. Only continue for trusted repositories.`,
+					);
+					if (!ok)
+						return {
+							content: [{ type: "text", text: "Canceled: project-local agents not approved." }],
+							details: makeDetails(hasChain ? "chain" : hasTasks ? "parallel" : "single")([]),
+						};
+				}
+			}
+
+			if (hasTasks) {
+				if (params.tasks!.length > MAX_PARALLEL_TASKS) {
+					throw new Error(`Too many parallel tasks (${params.tasks!.length}). Max is ${MAX_PARALLEL_TASKS}.`);
+				}
 			}
 
 			// ── V2: Background parallel ──
 			if (params.background && hasTasks) {
+				const invocations = params.tasks!.map(t => resolveInvocation({ agents, spec: t, teamName }));
 				const { groupId, memberIds, queuedCount } = launchBackgroundParallel(
 					{ tasks: params.tasks!, saveAs: params.saveAs, notifyPerTask: params.notifyPerTask },
 					agents, ctx.cwd, teamName,
+					invocations
 				);
 				const runningCount = memberIds.length - queuedCount;
 				return {
@@ -1770,9 +1895,16 @@ export default function (pi: ExtensionAPI) {
 
 			// ── V2: Background chain ──
 			if (params.background && hasChain) {
+				// Preflight all steps with empty previousOutput to catch early errors
+				for (let i = 0; i < params.chain!.length; i++) {
+					resolveInvocation({ agents, spec: params.chain![i], teamName, previousOutput: "", isPreflight: true });
+				}
+
+				const firstInvocation = resolveInvocation({ agents, spec: params.chain![0], teamName });
 				const { groupId, firstMemberId } = launchBackgroundChain(
 					{ chain: params.chain!, saveAs: params.saveAs, notifyPerTask: params.notifyPerTask },
 					agents, ctx.cwd, teamName,
+					firstInvocation
 				);
 				return {
 					content: [{
@@ -1786,41 +1918,24 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 
-			if ((agentScope === "project" || agentScope === "both") && confirmProjectAgents && ctx.hasUI) {
-				const requestedAgentNames = new Set<string>();
-				if (params.chain) for (const step of params.chain) requestedAgentNames.add(step.agent);
-				if (params.tasks) for (const t of params.tasks) requestedAgentNames.add(t.agent);
-				if (params.agent) requestedAgentNames.add(params.agent);
-
-				const projectAgentsRequested = Array.from(requestedAgentNames)
-					.map((name) => agents.find((a) => a.name === name))
-					.filter((a): a is AgentConfig => a?.source === "project");
-
-				if (projectAgentsRequested.length > 0) {
-					const names = projectAgentsRequested.map((a) => a.name).join(", ");
-					const dir = discovery.projectAgentsDir ?? "(unknown)";
-					const ok = await ctx.ui.confirm(
-						"Run project-local agents?",
-						`Agents: ${names}\nSource: ${dir}\n\nProject agents are repo-controlled. Only continue for trusted repositories.`,
-					);
-					if (!ok)
-						return {
-							content: [{ type: "text", text: "Canceled: project-local agents not approved." }],
-							details: makeDetails(hasChain ? "chain" : hasTasks ? "parallel" : "single")([]),
-						};
-				}
-			}
-
 			if (params.chain && params.chain.length > 0) {
+				// Preflight all steps
+				for (let i = 0; i < params.chain.length; i++) {
+					resolveInvocation({ agents, spec: params.chain[i], teamName, previousOutput: "", isPreflight: true });
+				}
+
 				const results: SingleResult[] = [];
-				let previousOutput = "";
+				let previousOutput: string | undefined = undefined;
 
 				for (let i = 0; i < params.chain.length; i++) {
 					const step = params.chain[i];
-					let taskWithContext = step.task.replace(/\{previous\}/g, previousOutput);
-
-					// Team mode: expand output placeholders and prepend shared context
-					if (teamName) taskWithContext = buildTeamTask(teamName, taskWithContext);
+					const invocation = resolveInvocation({
+						agents,
+						spec: step,
+						teamName,
+						previousOutput,
+						step: i + 1,
+					});
 
 					// Create update callback that includes all previous results
 					const chainUpdate: OnUpdateCallback | undefined = onUpdate
@@ -1837,8 +1952,7 @@ export default function (pi: ExtensionAPI) {
 						: undefined;
 
 					const result = await runSingleAgent(
-						ctx.cwd, agents, step.agent, taskWithContext, step.cwd, i + 1, signal, chainUpdate, makeDetails("chain"),
-						step.mcps, step.extensions, teamName,
+						ctx.cwd, invocation, signal, chainUpdate, makeDetails("chain")
 					);
 					results.push(result);
 
@@ -1869,26 +1983,22 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			if (params.tasks && params.tasks.length > 0) {
-				if (params.tasks.length > MAX_PARALLEL_TASKS)
-					return {
-						content: [
-							{
-								type: "text",
-								text: `Too many parallel tasks (${params.tasks.length}). Max is ${MAX_PARALLEL_TASKS}.`,
-							},
-						],
-						details: makeDetails("parallel")([]),
-					};
-
 				// Track all results for streaming updates
 				const allResults: SingleResult[] = new Array(params.tasks.length);
+				const invocations = params.tasks.map((t, index) => resolveInvocation({
+					agents,
+					spec: { ...t, saveAs: t.saveAs || (params.tasks!.length > 1 ? `${t.agent}-${index + 1}` : t.agent) },
+					teamName,
+				}));
 
 				// Initialize placeholder results
 				for (let i = 0; i < params.tasks.length; i++) {
 					allResults[i] = {
-						agent: params.tasks[i].agent,
-						agentSource: "unknown",
-						task: params.tasks[i].task,
+						agent: invocations[i].agentName,
+						agentSource: invocations[i].agent.source,
+						task: invocations[i].display,
+						promptKind: invocations[i].promptKind,
+						input: invocations[i].input,
 						exitCode: -1, // -1 = still running
 						messages: [],
 						stderr: "",
@@ -1910,21 +2020,18 @@ export default function (pi: ExtensionAPI) {
 					}
 				};
 
-				const results = await mapWithConcurrencyLimit(params.tasks, MAX_CONCURRENCY, async (t, index) => {
-					// Team mode: expand output placeholders and prepend shared context
-					const taskText = teamName ? buildTeamTask(teamName, t.task) : t.task;
-					const outputName = t.saveAs || (params.tasks!.length > 1 ? `${t.agent}-${index + 1}` : t.agent);
+				const results = await mapWithConcurrencyLimit(invocations, MAX_CONCURRENCY, async (invocation, index) => {
+					const outputName = invocation.saveAs || invocation.agentName;
 
 					const result = await runSingleAgent(
-						ctx.cwd, agents, t.agent, taskText, t.cwd, undefined, signal,
+						ctx.cwd, invocation, signal,
 						(partial) => {
 							if (partial.details?.results[0]) {
 								allResults[index] = partial.details.results[0];
 								emitParallelUpdate();
 							}
 						},
-						makeDetails("parallel"),
-						t.mcps, t.extensions, teamName,
+						makeDetails("parallel")
 					);
 
 					// Team mode: save named output
@@ -1958,33 +2065,28 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 
-			if (params.agent && params.task) {
+			if (params.agent && (params.task !== undefined || params.input !== undefined)) {
+				const outputName = params.saveAs || params.agent;
+				const invocation = resolveInvocation({
+					agents,
+					spec: {
+						agent: params.agent,
+						task: params.task,
+						input: params.input,
+						cwd: params.cwd,
+						saveAs: outputName,
+						mcps: params.mcps,
+						extensions: params.extensions,
+					},
+					teamName,
+				});
+
 				// ── Background mode ──
 				if (params.background) {
-					if (!params.agent || !params.task) {
-						return {
-							content: [{ type: "text", text: "background: true requires single mode (agent + task)." }],
-							details: makeDetails("single")([]),
-							isError: true,
-						};
-					}
-
-					const taskText = teamName ? buildTeamTask(teamName, params.task) : params.task;
-					const agentConfig = agents.find((a) => a.name === params.agent);
-					if (!agentConfig) {
-						const available = agents.map((a) => `"${a.name}"`).join(", ") || "none";
-						return {
-							content: [{ type: "text", text: `Unknown agent: "${params.agent}". Available: ${available}` }],
-							details: makeDetails("single")([]),
-							isError: true,
-						};
-					}
-
-					const jobId = generateBgId(params.agent, params.saveAs);
-					const saveAs = params.saveAs || params.agent;
+					const jobId = generateBgId(invocation.agentName, invocation.saveAs);
 
 					// Build spawn args (same as runSingleAgent but --mode rpc)
-					const spawnArgs = buildBgSpawnArgs(agentConfig, params.mcps, params.extensions, teamName);
+					const spawnArgs = buildBgSpawnArgs(invocation.agent, invocation.mcps, invocation.extensions, teamName);
 
 					// Check concurrency
 					const runningCount = [...backgroundAgents.values()].filter(
@@ -1993,13 +2095,18 @@ export default function (pi: ExtensionAPI) {
 
 					const bgAgent: BackgroundAgent = {
 						id: jobId,
-						agent: params.agent,
-						task: taskText,
+						agent: invocation.agentName,
+						task: invocation.display,
+						prompt: invocation.prompt,
+						promptKind: invocation.promptKind,
+						input: invocation.input,
 						proc: null,
 						result: {
-							agent: params.agent,
-							agentSource: agentConfig.source,
-							task: taskText,
+							agent: invocation.agentName,
+							agentSource: invocation.agent.source,
+							task: invocation.display,
+							promptKind: invocation.promptKind,
+							input: invocation.input,
 							exitCode: -1,
 							messages: [],
 							stderr: "",
@@ -2008,13 +2115,13 @@ export default function (pi: ExtensionAPI) {
 						},
 						status: runningCount >= MAX_BG_CONCURRENCY ? "queued" : "running",
 						startTime: Date.now(),
-						cwd: params.cwd ?? ctx.cwd,
-						agentConfig,
+						cwd: invocation.cwd ?? ctx.cwd,
+						agentConfig: invocation.agent,
 						spawnArgs,
 						teamName,
-						saveAs,
-						extensions: params.extensions,
-						mcps: params.mcps,
+						saveAs: invocation.saveAs,
+						extensions: invocation.extensions,
+						mcps: invocation.mcps,
 					};
 
 					backgroundAgents.set(jobId, bgAgent);
@@ -2049,13 +2156,8 @@ export default function (pi: ExtensionAPI) {
 					};
 				}
 
-				// Team mode: expand output placeholders and prepend shared context
-				const taskText = teamName ? buildTeamTask(teamName, params.task) : params.task;
-				const outputName = params.saveAs || params.agent;
-
 				const result = await runSingleAgent(
-					ctx.cwd, agents, params.agent, taskText, params.cwd, undefined, signal, onUpdate, makeDetails("single"),
-					params.mcps, params.extensions, teamName,
+					ctx.cwd, invocation, signal, onUpdate, makeDetails("single"),
 				);
 
 				// Team mode: save named output
@@ -2100,9 +2202,8 @@ export default function (pi: ExtensionAPI) {
 					theme.fg("muted", ` [${scope}]`);
 				for (let i = 0; i < Math.min(args.chain.length, 3); i++) {
 					const step = args.chain[i];
-					// Clean up {previous} placeholder for display
-					const cleanTask = step.task.replace(/\{previous\}/g, "").trim();
-					const preview = cleanTask.length > 40 ? `${cleanTask.slice(0, 40)}...` : cleanTask;
+					const displayTask = step.task ? step.task.replace(/\{previous\}/g, "").trim() : displayInputSummary(step.input);
+					const preview = displayTask.length > 40 ? `${displayTask.slice(0, 40)}...` : displayTask;
 					text +=
 						"\n  " +
 						theme.fg("muted", `${i + 1}.`) +
@@ -2119,14 +2220,16 @@ export default function (pi: ExtensionAPI) {
 					theme.fg("accent", `parallel (${args.tasks.length} tasks)`) +
 					theme.fg("muted", ` [${scope}]`);
 				for (const t of args.tasks.slice(0, 3)) {
-					const preview = t.task.length > 40 ? `${t.task.slice(0, 40)}...` : t.task;
+					const displayTask = t.task ? t.task : displayInputSummary(t.input);
+					const preview = displayTask.length > 40 ? `${displayTask.slice(0, 40)}...` : displayTask;
 					text += `\n  ${theme.fg("accent", t.agent)}${theme.fg("dim", ` ${preview}`)}`;
 				}
 				if (args.tasks.length > 3) text += `\n  ${theme.fg("muted", `... +${args.tasks.length - 3} more`)}`;
 				return new Text(text, 0, 0);
 			}
 			const agentName = args.agent || "...";
-			const preview = args.task ? (args.task.length > 60 ? `${args.task.slice(0, 60)}...` : args.task) : "...";
+			const displayTask = args.task ? args.task : args.input !== undefined ? displayInputSummary(args.input) : "...";
+			const preview = displayTask.length > 60 ? `${displayTask.slice(0, 60)}...` : displayTask;
 			let text =
 				theme.fg("toolTitle", theme.bold("subagent ")) +
 				theme.fg("accent", agentName) +
@@ -2179,7 +2282,7 @@ export default function (pi: ExtensionAPI) {
 					if (isError && r.errorMessage)
 						container.addChild(new Text(theme.fg("error", `Error: ${r.errorMessage}`), 0, 0));
 					container.addChild(new Spacer(1));
-					container.addChild(new Text(theme.fg("muted", "─── Task ───"), 0, 0));
+					container.addChild(new Text(theme.fg("muted", r.promptKind === "input" ? "─── Input ───" : "─── Task ───"), 0, 0));
 					container.addChild(new Text(theme.fg("dim", r.task), 0, 0));
 					container.addChild(new Spacer(1));
 					container.addChild(new Text(theme.fg("muted", "─── Output ───"), 0, 0));
@@ -2278,7 +2381,8 @@ export default function (pi: ExtensionAPI) {
 								0,
 							),
 						);
-						container.addChild(new Text(theme.fg("muted", "Task: ") + theme.fg("dim", r.task), 0, 0));
+						const label = r.promptKind === "input" ? "Input: " : "Task: ";
+						container.addChild(new Text(theme.fg("muted", label) + theme.fg("dim", r.task), 0, 0));
 
 						// Show tool calls
 						for (const item of displayItems) {
@@ -2370,7 +2474,8 @@ export default function (pi: ExtensionAPI) {
 						container.addChild(
 							new Text(`${theme.fg("muted", "─── ") + theme.fg("accent", r.agent)} ${rIcon}`, 0, 0),
 						);
-						container.addChild(new Text(theme.fg("muted", "Task: ") + theme.fg("dim", r.task), 0, 0));
+						const label = r.promptKind === "input" ? "Input: " : "Task: ";
+						container.addChild(new Text(theme.fg("muted", label) + theme.fg("dim", r.task), 0, 0));
 
 						// Show tool calls
 						for (const item of displayItems) {
@@ -2617,7 +2722,7 @@ export default function (pi: ExtensionAPI) {
 								`Turns: ${turns}`,
 								lastTools.length > 0 ? `Recent tools: ${lastTools.join(", ")}` : null,
 								usageStr ? `Usage: ${usageStr}` : null,
-								`Task: ${bgAgent.task.slice(0, 150)}`,
+								`${bgAgent.promptKind === "input" ? "Input" : "Task"}: ${bgAgent.task.slice(0, 150)}`,
 							]
 								.filter(Boolean)
 								.join("\n"),

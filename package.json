@@ -2,17 +2,32 @@
   "name": "pi-subagent",
   "version": "1.0.0",
   "description": "Multi-agent orchestration for PI — spawn specialized agents, coordinate teams, share context",
-  "keywords": ["pi-package", "agents", "multi-agent", "subagent", "teams"],
-  "repository": { "type": "git", "url": "https://github.com/cdias900/pi-subagent" },
+  "keywords": [
+    "pi-package",
+    "agents",
+    "multi-agent",
+    "subagent",
+    "teams"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/cdias900/pi-subagent"
+  },
   "license": "MIT",
   "peerDependencies": {
-    "@mariozechner/pi-ai": "*",
     "@mariozechner/pi-agent-core": "*",
+    "@mariozechner/pi-ai": "*",
     "@mariozechner/pi-coding-agent": "*",
     "@mariozechner/pi-tui": "*",
     "@sinclair/typebox": "*"
   },
   "pi": {
-    "extensions": ["./index.ts"]
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "dependencies": {
+    "ajv": "^8.20.0",
+    "ajv-formats": "^3.0.1"
   }
 }
