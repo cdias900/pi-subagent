@@ -30,6 +30,10 @@ export interface AgentConfig {
 	inputInstructions?: string;
 	allowFreeform?: boolean;
 	allowRuntimeTools?: boolean;
+	systemPromptMode?: "append" | "replace";
+	noSkills?: boolean;
+	noPromptTemplates?: boolean;
+	noContextFiles?: boolean;
 }
 
 export interface AgentDiscoveryResult {
@@ -56,7 +60,7 @@ function asStringList(value: unknown): string[] | undefined {
 	return undefined;
 }
 
-function loadAgentsFromDir(dir: string, source: AgentConfig["source"], diagnostics: string[]): AgentConfig[] {
+export function loadAgentsFromDir(dir: string, source: AgentConfig["source"], diagnostics: string[]): AgentConfig[] {
 	const agents: AgentConfig[] = [];
 
 	if (!fs.existsSync(dir)) return agents;
@@ -101,10 +105,22 @@ function loadAgentsFromDir(dir: string, source: AgentConfig["source"], diagnosti
 			const tools = asStringList(frontmatter.tools);
 			const extensions = asStringList(frontmatter.extensions);
 
+			const systemPromptMode = asString(frontmatter.systemPromptMode);
+			if (
+				systemPromptMode !== undefined &&
+				systemPromptMode !== "append" &&
+				systemPromptMode !== "replace"
+			) {
+				diagnostics.push(
+					`Agent '${name}' in ${source} skipped due to invalid systemPromptMode: must be 'append' or 'replace', got '${systemPromptMode}'`,
+				);
+				continue;
+			}
+
 			agents.push({
 				name,
 				description,
-				tools: tools && tools.length > 0 ? tools : undefined,
+				tools,
 				extensions: extensions && extensions.length > 0 ? extensions : undefined,
 				model: asString(frontmatter.model),
 				systemPrompt: body,
@@ -114,6 +130,10 @@ function loadAgentsFromDir(dir: string, source: AgentConfig["source"], diagnosti
 				inputInstructions: asString(frontmatter.inputInstructions),
 				allowFreeform: asBoolean(frontmatter.allowFreeform),
 				allowRuntimeTools: asBoolean(frontmatter.allowRuntimeTools),
+				systemPromptMode: systemPromptMode as "append" | "replace" | undefined,
+				noSkills: asBoolean(frontmatter.noSkills),
+				noPromptTemplates: asBoolean(frontmatter.noPromptTemplates),
+				noContextFiles: asBoolean(frontmatter.noContextFiles),
 			});
 		} catch (err: any) {
 			diagnostics.push(`Failed to parse agent file ${filePath}: ${err.message}`);

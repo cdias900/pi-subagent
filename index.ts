@@ -23,7 +23,7 @@ import { StringEnum } from "@mariozechner/pi-ai";
 import { type ExtensionAPI, getAgentDir, getMarkdownTheme } from "@mariozechner/pi-coding-agent";
 import { Container, Markdown, Spacer, Text } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
-import { type AgentConfig, type AgentScope, discoverAgents } from "./agents.js";
+import { type AgentConfig, type AgentDiscoveryResult, type AgentScope, discoverAgents } from "./agents.js";
 import { registerCoordinationTools } from "./coordination.js";
 import {
 	buildCompactAgentInfo,
@@ -73,7 +73,7 @@ function buildExtensionMap(agentDir: string): Map<string, string> {
 		}
 	}
 
-	// 2. Installed git packages — scan extensions/ subdirectories
+	// 2. Installed git packages — scan extensions/ subdirectories AND package roots
 	const gitDir = path.join(agentDir, "git", "github.com");
 	if (fs.existsSync(gitDir)) {
 		for (const user of fs.readdirSync(gitDir, { withFileTypes: true })) {
@@ -90,6 +90,16 @@ function buildExtensionMap(agentDir: string): Map<string, string> {
 								extMap.set(ext.name, extIdx);
 							}
 						}
+					}
+				}
+				// Also register package-root extensions: a repo whose entry point is
+				// index.ts at the repo root, keyed by repo name, so subagents can load
+				// them via extensions: ["<repo-name>"]. Existing global / extensions-subdir
+				// entries take precedence.
+				if (!extMap.has(repo.name)) {
+					const rootExtIdx = path.join(userDir, repo.name, "index.ts");
+					if (fs.existsSync(rootExtIdx)) {
+						extMap.set(repo.name, rootExtIdx);
 					}
 				}
 			}
@@ -562,6 +572,104 @@ function writePromptToTempFile(agentName: string, prompt: string): { dir: string
 	return { dir: tmpDir, filePath };
 }
 
+/**
+ * Build the `--tools` / `--no-tools` flag args for a foreground (synchronous) spawn.
+ *
+ *  - tools omitted (undefined) => no flag (inherit child defaults)
+ *  - tools []                 => `--no-tools` (disable all built-in tools)
+ *  - tools non-empty           => `--tools a,b,c` (restrict to the listed tools)
+ */
+export function buildForegroundToolArgs(tools?: string[]): string[] {
+	if (tools === undefined) return [];
+	if (tools.length === 0) return ["--no-tools"];
+	return ["--tools", tools.join(",")];
+}
+
+/**
+ * Build the `--tools` flag args for a background spawn.
+ *
+ * The background child always needs the internal `__bg_signal` tool (registered via
+ * the bg-signal extension, which is always loaded with `-e`). This helper guarantees
+ * it survives restrictive allowlists. The `--tools` flag is a name allowlist that
+ * applies to built-in, extension, and custom tools alike, so listing only
+ * `__bg_signal` activates just that lifecycle tool and no task tools — without
+ * depending on the `--no-builtin-tools` flag introduced in Pi 0.80.2:
+ *
+ *  - tools omitted (undefined) => no flag (existing behavior; child inherits default
+ *                                 tools; __bg_signal registered via the loaded extension)
+ *  - tools []                  => `--tools __bg_signal` (only the internal lifecycle
+ *                                 tool is active; all task tools — built-in, extension,
+ *                                 and MCP — are disabled)
+ *  - tools non-empty            => `--tools a,b,c,__bg_signal` (appended without duplicates)
+ */
+export function buildBackgroundToolArgs(tools?: string[]): string[] {
+	if (tools === undefined) return [];
+	if (tools.length === 0) return ["--tools", "__bg_signal"];
+	if (tools.includes("__bg_signal")) return ["--tools", tools.join(",")];
+	return ["--tools", [...tools, "__bg_signal"].join(",")];
+}
+
+/**
+ * Build only the individually-requested isolation flag args (`--no-skills`,
+ * `--no-prompt-templates`, `--no-context-files`). Used when a spawn has no
+ * system-prompt file to pass (empty body, append/default mode) but still wants
+ * to honor per-field isolation overrides.
+ */
+export function buildIsolationArgs(opts: {
+	noSkills?: boolean;
+	noPromptTemplates?: boolean;
+	noContextFiles?: boolean;
+}): string[] {
+	const args: string[] = [];
+	if (opts.noSkills) args.push("--no-skills");
+	if (opts.noPromptTemplates) args.push("--no-prompt-templates");
+	if (opts.noContextFiles) args.push("--no-context-files");
+	return args;
+}
+
+/**
+ * Build system-prompt and isolation flag args for a spawn (foreground or background).
+ *
+ *  - systemPromptMode "replace" => `--system-prompt <path>` and automatically adds
+ *    `--no-skills`, `--no-prompt-templates`, `--no-context-files`.
+ *  - systemPromptMode "append" / undefined (default) => `--append-system-prompt <path>`,
+ *    with individually true `noSkills` / `noPromptTemplates` / `noContextFiles` honored.
+ */
+export function buildSystemPromptArgs(opts: {
+	systemPromptMode?: "append" | "replace";
+	noSkills?: boolean;
+	noPromptTemplates?: boolean;
+	noContextFiles?: boolean;
+	promptFilePath: string;
+}): string[] {
+	if (opts.systemPromptMode === "replace") {
+		return [
+			"--system-prompt",
+			opts.promptFilePath,
+			"--no-skills",
+			"--no-prompt-templates",
+			"--no-context-files",
+		];
+	}
+	const args: string[] = ["--append-system-prompt", opts.promptFilePath];
+	args.push(...buildIsolationArgs(opts));
+	return args;
+}
+
+/**
+ * Resolve agent discovery for a tool invocation by funnelling the cwd/scope
+ * fallback through a single pure seam. Project-local `.pi/agents` are
+ * discovered relative to `params.cwd` (when supplied) so that a caller-provided
+ * working directory wins over the host ctx cwd — this is what keeps
+ * list_subagents / describe_agent / subagent discovery in sync.
+ */
+export function resolveScopeDiscovery(
+	params: { cwd?: string; agentScope?: AgentScope },
+	ctxCwd: string,
+): AgentDiscoveryResult {
+	return discoverAgents(params.cwd ?? ctxCwd, params.agentScope ?? "user");
+}
+
 type OnUpdateCallback = (partial: AgentToolResult<SubagentDetails>) => void;
 
 async function runSingleAgent(
@@ -611,7 +719,7 @@ async function runSingleAgent(
 	}
 
 	if (agent.model) args.push("--model", agent.model);
-	if (agent.tools && agent.tools.length > 0) args.push("--tools", agent.tools.join(","));
+	args.push(...buildForegroundToolArgs(agent.tools));
 
 	let tmpPromptDir: string | null = null;
 	let tmpPromptPath: string | null = null;
@@ -644,11 +752,32 @@ async function runSingleAgent(
 	const elapsedInterval = onUpdate ? setInterval(emitUpdate, 1000) : null;
 
 	try {
-		if (agent.systemPrompt.trim()) {
+		const hasPromptBody = agent.systemPrompt.trim().length > 0;
+		const isReplace = agent.systemPromptMode === "replace";
+
+		if (hasPromptBody || isReplace) {
+			// Write the prompt file (possibly empty for replace mode with an empty
+			// body) and emit the system-prompt flag plus isolation flags.
+			// Replace mode must still pass --system-prompt so Pi's default prompt is
+			// fully overridden, and it auto-adds all three --no-* isolation flags.
 			const tmp = writePromptToTempFile(agent.name, agent.systemPrompt);
 			tmpPromptDir = tmp.dir;
 			tmpPromptPath = tmp.filePath;
-			args.push("--append-system-prompt", tmpPromptPath);
+			args.push(...buildSystemPromptArgs({
+				systemPromptMode: agent.systemPromptMode,
+				noSkills: agent.noSkills,
+				noPromptTemplates: agent.noPromptTemplates,
+				noContextFiles: agent.noContextFiles,
+				promptFilePath: tmpPromptPath,
+			}));
+		} else {
+			// Empty body with append/default mode: no prompt file or prompt flag,
+			// but individually-true isolation overrides are still honored.
+			args.push(...buildIsolationArgs({
+				noSkills: agent.noSkills,
+				noPromptTemplates: agent.noPromptTemplates,
+				noContextFiles: agent.noContextFiles,
+			}));
 		}
 
 		args.push(invocation.prompt);
@@ -845,7 +974,7 @@ function buildBgSpawnArgs(
 	args.push("-e", BG_SIGNAL_EXT_PATH);
 
 	if (agentConfig.model) args.push("--model", agentConfig.model);
-	if (agentConfig.tools && agentConfig.tools.length > 0) args.push("--tools", agentConfig.tools.join(","));
+	args.push(...buildBackgroundToolArgs(agentConfig.tools));
 
 	return args;
 }
@@ -865,7 +994,13 @@ function launchBackgroundAgent(bgAgent: BackgroundAgent): void {
 		tmpPromptPath = tmp.filePath;
 		bgAgent.tmpPromptDir = tmpPromptDir;
 		bgAgent.tmpPromptPath = tmpPromptPath;
-		bgAgent.spawnArgs.push("--append-system-prompt", tmpPromptPath);
+		bgAgent.spawnArgs.push(...buildSystemPromptArgs({
+			systemPromptMode: bgAgent.agentConfig.systemPromptMode,
+			noSkills: bgAgent.agentConfig.noSkills,
+			noPromptTemplates: bgAgent.agentConfig.noPromptTemplates,
+			noContextFiles: bgAgent.agentConfig.noContextFiles,
+			promptFilePath: tmpPromptPath,
+		}));
 	}
 
 	// Set up MCP config if needed
@@ -1620,14 +1755,14 @@ const TaskItem = Type.Object({
 	mcps: Type.Optional(
 		Type.Array(Type.String(), {
 			description:
-				"MCP server names this agent needs (e.g. [\"grokt-mcp\", \"dev-mcp\"]). " +
+				"MCP server names this agent needs (e.g. [\"my-mcp\", \"other-mcp\"]). " +
 				"Only these MCPs are loaded. Omit for no MCPs (fastest). Requires team mode.",
 		}),
 	),
 	extensions: Type.Optional(
 		Type.Array(Type.String(), {
 			description:
-				"Extension names this agent needs (e.g. [\"slack\", \"observe\"]). " +
+				"Extension names this agent needs (e.g. [\"my-ext\", \"other-ext\"]). " +
 				"Only these extensions are loaded. Merged with agent's frontmatter extensions. Omit for none.",
 		}),
 	),
@@ -1644,14 +1779,14 @@ const ChainItem = Type.Object({
 	mcps: Type.Optional(
 		Type.Array(Type.String(), {
 			description:
-				"MCP server names this agent needs (e.g. [\"grokt-mcp\", \"dev-mcp\"]). " +
+				"MCP server names this agent needs (e.g. [\"my-mcp\", \"other-mcp\"]). " +
 				"Only these MCPs are loaded. Omit for no MCPs (fastest). Requires team mode.",
 		}),
 	),
 	extensions: Type.Optional(
 		Type.Array(Type.String(), {
 			description:
-				"Extension names this agent needs (e.g. [\"slack\", \"observe\"]). " +
+				"Extension names this agent needs (e.g. [\"my-ext\", \"other-ext\"]). " +
 				"Only these extensions are loaded. Merged with agent's frontmatter extensions. Omit for none.",
 		}),
 	),
@@ -1683,7 +1818,7 @@ const SubagentParams = Type.Object({
 	confirmProjectAgents: Type.Optional(
 		Type.Boolean({ description: "Prompt before running project-local agents. Default: true.", default: true }),
 	),
-	cwd: Type.Optional(Type.String({ description: "Working directory for the agent process (single mode)" })),
+	cwd: Type.Optional(Type.String({ description: "Working directory for the agent process (single mode) and root used to discover project-local .pi/agents. Defaults to current cwd." })),
 	team: Type.Optional(
 		Type.String({
 			description:
@@ -1697,14 +1832,14 @@ const SubagentParams = Type.Object({
 	mcps: Type.Optional(
 		Type.Array(Type.String(), {
 			description:
-				"MCP server names this agent needs (e.g. [\"grokt-mcp\", \"dev-mcp\"]). " +
+				"MCP server names this agent needs (e.g. [\"my-mcp\", \"other-mcp\"]). " +
 				"Only these MCPs are loaded. Omit for no MCPs (fastest). Requires team mode.",
 		}),
 	),
 	extensions: Type.Optional(
 		Type.Array(Type.String(), {
 			description:
-				"Extension names this agent needs (e.g. [\"slack\", \"observe\"]). " +
+				"Extension names this agent needs (e.g. [\"my-ext\", \"other-ext\"]). " +
 				"Only these extensions are loaded. Merged with agent's frontmatter extensions. Omit for none.",
 		}),
 	),
@@ -1744,7 +1879,7 @@ export default function (pi: ExtensionAPI) {
 		parameters: AgentDiscoveryParams,
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			const scope = params.agentScope ?? "user";
-			const discovery = discoverAgents(params.cwd ?? ctx.cwd, scope);
+			const discovery = resolveScopeDiscovery(params, ctx.cwd);
 
 			const agents = [...discovery.agents].sort((a, b) => a.name.localeCompare(b.name));
 
@@ -1770,7 +1905,7 @@ export default function (pi: ExtensionAPI) {
 		parameters: DescribeAgentParams,
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			const scope = params.agentScope ?? "user";
-			const discovery = discoverAgents(params.cwd ?? ctx.cwd, scope);
+			const discovery = resolveScopeDiscovery(params, ctx.cwd);
 
 			const agent = discovery.agents.find(a => a.name === params.agent);
 			if (!agent) {
@@ -1803,7 +1938,7 @@ export default function (pi: ExtensionAPI) {
 
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
 			const agentScope: AgentScope = params.agentScope ?? "user";
-			const discovery = discoverAgents(ctx.cwd, agentScope);
+			const discovery = resolveScopeDiscovery(params, ctx.cwd);
 			const agents = discovery.agents;
 			const confirmProjectAgents = params.confirmProjectAgents ?? true;
 
