@@ -125,30 +125,61 @@ describe("all background spawn routes use the shared buildBgSpawnArgs helper", (
 		expect(helperBody).toContain("buildBackgroundToolArgs");
 	});
 
+	it("buildBgSpawnArgs delegates resolved model flags to buildModelArgs", () => {
+		const helperBody = extractFunctionBody(INDEX_SRC, "buildBgSpawnArgs");
+		expect(helperBody).toContain("buildModelArgs(resolved)");
+		expect(helperBody).not.toContain("agentConfig.model");
+	});
+
+	it("buildBgSpawnArgs keeps model flags after extensions and before tool flags", () => {
+		const helperBody = extractFunctionBody(INDEX_SRC, "buildBgSpawnArgs");
+		const extensionIdx = helperBody.lastIndexOf('args.push("-e"');
+		const modelIdx = helperBody.indexOf("buildModelArgs(resolved)");
+		const toolsIdx = helperBody.indexOf("buildBackgroundToolArgs");
+		expect(extensionIdx).toBeGreaterThanOrEqual(0);
+		expect(extensionIdx).toBeLessThan(modelIdx);
+		expect(modelIdx).toBeLessThan(toolsIdx);
+	});
+
 	it("buildBgSpawnArgs loads the bg-signal extension (-e BG_SIGNAL_EXT_PATH)", () => {
 		const helperBody = extractFunctionBody(INDEX_SRC, "buildBgSpawnArgs");
 		expect(helperBody).toContain("-e");
 		expect(helperBody).toContain("BG_SIGNAL_EXT_PATH");
 	});
 
-	it("single background path calls buildBgSpawnArgs", () => {
+	it("single background path calls buildBgSpawnArgs with its resolved model", () => {
 		// The single-agent background branch passes invocation.agent as the first arg,
 		// distinguishing it from the parallel/chain call shape (agentConfig, ...).
-		expect(INDEX_SRC).toMatch(/buildBgSpawnArgs\(invocation\.agent,/);
+		const calls = INDEX_SRC.match(
+			/buildBgSpawnArgs\(invocation\.agent, invocation\.resolvedModel,/g,
+		) ?? [];
+		expect(calls).toHaveLength(1);
 	});
 
-	it("parallel + chain background paths call buildBgSpawnArgs with (agentConfig, invocation.mcps, ...)", () => {
+	it("parallel + chain background paths pass invocation.resolvedModel to buildBgSpawnArgs", () => {
 		// Both launchBackgroundParallel and launchBackgroundChain share this exact call shape.
 		const calls = INDEX_SRC.match(
-			/buildBgSpawnArgs\(agentConfig, invocation\.mcps, invocation\.extensions, teamName\)/g,
+			/buildBgSpawnArgs\(agentConfig, invocation\.resolvedModel, invocation\.mcps, invocation\.extensions, teamName\)/g,
 		);
 		expect(calls && calls.length).toBeGreaterThanOrEqual(2);
 	});
 
-	it("advanceChain (team/chain continuation) calls buildBgSpawnArgs with group.teamName", () => {
+	it("advanceChain passes the stored resolved model to buildBgSpawnArgs", () => {
 		expect(INDEX_SRC).toMatch(
-			/buildBgSpawnArgs\(agentConfig, stepDef\.mcps, stepDef\.extensions, group\.teamName\)/,
+			/buildBgSpawnArgs\(agentConfig, stepDef\.resolvedModel, stepDef\.mcps, stepDef\.extensions, group\.teamName\)/,
 		);
+	});
+
+	it("advanceChain reuses its preflight-resolved model without rebuilding or revalidating it", () => {
+		const body = extractFunctionBody(INDEX_SRC, "advanceChain");
+		expect(body).toContain("resolvedModel: stepDef.resolvedModel");
+		for (const forbidden of [
+			"resolveModelLayers",
+			"buildModelResolution",
+			"validateResolvedModel",
+		]) {
+			expect(body).not.toContain(forbidden);
+		}
 	});
 
 	it("launchBackgroundParallel and launchBackgroundChain each funnel buildBgSpawnArgs to launchBackgroundAgent", () => {
@@ -156,7 +187,7 @@ describe("all background spawn routes use the shared buildBgSpawnArgs helper", (
 		// of that shape must be followed by a launchBackgroundAgent call within the
 		// same route block (bounded window), so neither route can silently bypass
 		// the shared spawn helper.
-		const shape = /buildBgSpawnArgs\(agentConfig, invocation\.mcps, invocation\.extensions, teamName\)/g;
+		const shape = /buildBgSpawnArgs\(agentConfig, invocation\.resolvedModel, invocation\.mcps, invocation\.extensions, teamName\)/g;
 		const occurrences: RegExpExecArray[] = [];
 		let m: RegExpExecArray | null;
 		while ((m = shape.exec(INDEX_SRC)) !== null) occurrences.push(m);
@@ -168,13 +199,13 @@ describe("all background spawn routes use the shared buildBgSpawnArgs helper", (
 	});
 
 	it("advanceChain (team/chain continuation) builds args via buildBgSpawnArgs and spawns via launchBackgroundAgent", () => {
-		assertRouteFunnel(INDEX_SRC, /buildBgSpawnArgs\(agentConfig, stepDef\.mcps, stepDef\.extensions, group\.teamName\)/);
+		assertRouteFunnel(INDEX_SRC, /buildBgSpawnArgs\(agentConfig, stepDef\.resolvedModel, stepDef\.mcps, stepDef\.extensions, group\.teamName\)/);
 	});
 
 	it("the single-agent background branch builds args via buildBgSpawnArgs and spawns via launchBackgroundAgent", () => {
 		// The single-agent background path lives in the default-export handler and
-		// is identified by its distinctive buildBgSpawnArgs(invocation.agent, ...) shape.
-		assertRouteFunnel(INDEX_SRC, /buildBgSpawnArgs\(invocation\.agent,/);
+		// is identified by its distinctive resolved-model call shape.
+		assertRouteFunnel(INDEX_SRC, /buildBgSpawnArgs\(invocation\.agent, invocation\.resolvedModel,/);
 	});
 
 	it("trySpawnQueued drains the queue through launchBackgroundAgent", () => {

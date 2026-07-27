@@ -18,12 +18,18 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { AgentToolResult } from "@mariozechner/pi-agent-core";
-import type { Message } from "@mariozechner/pi-ai";
+import type { Api, Message, Model } from "@mariozechner/pi-ai";
 import { StringEnum } from "@mariozechner/pi-ai";
-import { type ExtensionAPI, getAgentDir, getMarkdownTheme } from "@mariozechner/pi-coding-agent";
+import {
+	type ExtensionAPI,
+	type ExtensionContext,
+	getAgentDir,
+	getMarkdownTheme,
+} from "@mariozechner/pi-coding-agent";
 import { Container, Markdown, Spacer, Text } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
 import { type AgentConfig, type AgentDiscoveryResult, type AgentScope, discoverAgents } from "./agents.js";
+import { registerAgentModelCommand } from "./agent-model-command.js";
 import { registerCoordinationTools } from "./coordination.js";
 import {
 	buildCompactAgentInfo,
@@ -35,6 +41,32 @@ import {
 	resolveInvocation,
 	displayInputSummary,
 } from "./invocation.js";
+import {
+	loadGlobalConfig,
+	resetGlobalOverride,
+	saveGlobalOverride,
+	type AgentModelOverride,
+	type SubagentModelConfig,
+} from "./model-config.js";
+import {
+	isThinkingLevel,
+	normalizeModelString,
+	splitProviderModel,
+	type SubagentThinkingLevel,
+} from "./model-normalize.js";
+import {
+	getSupportedThinkingLevelsCompat,
+	type ModelCatalogPort,
+	type ModelSource,
+	type ResolvedModelConfig,
+	resolveModelLayers,
+	validateResolvedModel,
+} from "./model-resolution.js";
+import {
+	appendSessionOverridesSnapshot,
+	computeUpdatedOverrides,
+	restoreSessionOverrides,
+} from "./model-session.js";
 import {
 	deleteTeam,
 	ensureTeamDir,
@@ -177,35 +209,6 @@ function formatDuration(ms: number): string {
 	return `${s}s`;
 }
 
-/**
- * Parse a model string like "openai/gpt-5.4:xhigh" or "anthropic-1m/claude-opus-4-6:high"
- * into { provider, model, reasoning }.
- */
-function parseModelString(modelStr: string): { provider: string; model: string; reasoning: string } {
-	let provider = "—";
-	let model = modelStr;
-	let reasoning = "off";
-
-	// Extract reasoning level from suffix ":level"
-	const colonIdx = model.lastIndexOf(":");
-	if (colonIdx > 0) {
-		const suffix = model.slice(colonIdx + 1);
-		if (["minimal", "low", "medium", "high", "xhigh"].includes(suffix)) {
-			reasoning = suffix;
-			model = model.slice(0, colonIdx);
-		}
-	}
-
-	// Extract provider from prefix "provider/"
-	const slashIdx = model.indexOf("/");
-	if (slashIdx > 0) {
-		provider = model.slice(0, slashIdx);
-		model = model.slice(slashIdx + 1);
-	}
-
-	return { provider, model, reasoning };
-}
-
 /** Known context window sizes (tokens) for common models. */
 const KNOWN_CONTEXT_WINDOWS: Record<string, number> = {
 	"claude-sonnet-4-20250514": 200000,
@@ -233,7 +236,7 @@ function getContextWindow(model: string): number | null {
 	return null;
 }
 
-function formatUsageStats(
+export function formatUsageStats(
 	usage: {
 		input: number;
 		output: number;
@@ -247,12 +250,16 @@ function formatUsageStats(
 	opts?: {
 		provider?: string;
 		elapsedMs?: number;
+		thinkingLevel?: SubagentThinkingLevel;
+		source?: ModelSource;
 	},
 ): string {
 	const sep = " │ ";
 	const hasSingleAgentData = !!model;
 
 	if (hasSingleAgentData) {
+		const parsed = normalizeModelString(model);
+
 		// Two-line format for single agent results
 		// Line 1: tokens │ cost │ context %
 		const line1Parts: string[] = [];
@@ -260,8 +267,7 @@ function formatUsageStats(
 		if (totalTokens > 0) line1Parts.push(`${formatTokens(totalTokens)} tokens`);
 		if (usage.cost) line1Parts.push(`$${usage.cost.toFixed(3)}`);
 		if (usage.contextTokens && usage.contextTokens > 0) {
-			const parsed = parseModelString(model);
-			const ctxWindow = getContextWindow(parsed.model);
+			const ctxWindow = getContextWindow(parsed.modelId);
 			if (ctxWindow) {
 				const pct = ((usage.contextTokens / ctxWindow) * 100).toFixed(1);
 				line1Parts.push(`${pct}% (${formatTokens(usage.contextTokens)}/${formatTokens(ctxWindow)})`);
@@ -273,9 +279,10 @@ function formatUsageStats(
 		// Line 2: turns │ provider ● model ● reasoning │ elapsed
 		const line2Parts: string[] = [];
 		if (usage.turns) line2Parts.push(`${usage.turns} turn${usage.turns > 1 ? "s" : ""}`);
-		const parsed = parseModelString(model);
-		const provider = opts?.provider || parsed.provider;
-		line2Parts.push(`${provider} ● ${parsed.model} ● ${parsed.reasoning}`);
+		const provider = opts?.provider || (parsed.provider ?? "—");
+		const reasoning = opts?.thinkingLevel ?? parsed.thinkingLevel ?? "off";
+		const modelLine = `${provider} ● ${parsed.modelId} ● ${reasoning}`;
+		line2Parts.push(opts?.source ? `${modelLine} ● ${opts.source}` : modelLine);
 		if (opts?.elapsedMs && opts.elapsedMs > 0) {
 			line2Parts.push(formatDuration(opts.elapsedMs));
 		}
@@ -383,6 +390,9 @@ interface SingleResult {
 	usage: UsageStats;
 	model?: string;
 	provider?: string;
+	resolvedModel?: string;
+	resolvedThinkingLevel?: SubagentThinkingLevel;
+	configSource?: ModelSource;
 	stopReason?: string;
 	errorMessage?: string;
 	step?: number;
@@ -390,6 +400,22 @@ interface SingleResult {
 	startTime: number;
 	promptKind?: "task" | "input";
 	input?: unknown;
+}
+
+export function buildResolvedModelMetadata(
+	resolved: ResolvedModelConfig,
+): {
+	resolvedModel?: string;
+	resolvedThinkingLevel?: SubagentThinkingLevel;
+	configSource: ModelSource;
+} {
+	return {
+		...(resolved.model !== undefined ? { resolvedModel: resolved.model } : {}),
+		...(resolved.thinkingLevel !== undefined
+			? { resolvedThinkingLevel: resolved.thinkingLevel }
+			: {}),
+		configSource: resolved.source,
+	};
 }
 
 interface SubagentDetails {
@@ -428,6 +454,142 @@ interface BackgroundAgent {
 
 const backgroundAgents = new Map<string, BackgroundAgent>();
 const bgAutoCounter = new Map<string, number>();
+let sessionModelOverrides: SubagentModelConfig = {};
+let piRef: ExtensionAPI | null = null;
+
+function parentModelForContext(ctx: ExtensionContext): AgentModelOverride {
+	const parentThinkingLevel = piRef?.getThinkingLevel();
+	return {
+		model: ctx.model
+			? `${ctx.model.provider}/${ctx.model.id}`
+			: undefined,
+		thinkingLevel:
+			parentThinkingLevel !== undefined && isThinkingLevel(parentThinkingLevel)
+				? parentThinkingLevel
+				: undefined,
+	};
+}
+
+export function buildEffectiveConfig(
+	agent: Pick<AgentConfig, "model">,
+	opts: {
+		session?: AgentModelOverride;
+		global?: AgentModelOverride;
+		parent?: AgentModelOverride;
+	},
+): ResolvedModelConfig {
+	return resolveModelLayers({
+		parent: opts.parent,
+		layers: [
+			{ model: agent.model, source: "frontmatter" },
+			opts.global === undefined
+				? undefined
+				: { ...opts.global, source: "global" },
+			opts.session === undefined
+				? undefined
+				: { ...opts.session, source: "session" },
+		],
+	});
+}
+
+function buildModelResolution(
+	agentName: string,
+	invocation: AgentModelOverride,
+	globalOverride: AgentModelOverride | undefined,
+	parent: AgentModelOverride,
+): {
+	invocation: AgentModelOverride;
+	session?: AgentModelOverride;
+	global?: AgentModelOverride;
+	parent: AgentModelOverride;
+} {
+	return {
+		invocation,
+		session: sessionModelOverrides[agentName],
+		global: globalOverride,
+		parent,
+	};
+}
+
+type PublicModelRegistry = Pick<
+	ExtensionContext["modelRegistry"],
+	"find" | "getAll" | "getAvailable"
+>;
+
+export function makeModelCatalogPort(
+	registry: PublicModelRegistry,
+): ModelCatalogPort {
+	return {
+		findExact(provider, id) {
+			if (provider === undefined) return undefined;
+			return registry.find(provider, id);
+		},
+		resolvePattern(pattern) {
+			const { provider, modelId } = splitProviderModel(pattern);
+			if (provider !== undefined) {
+				const exact = registry.find(provider, modelId);
+				if (exact !== undefined) return exact;
+			}
+
+			const normalizedPattern = pattern.toLowerCase();
+			const models = registry.getAll();
+			const exactFullId = models.find(
+				(model) =>
+					`${model.provider}/${model.id}`.toLowerCase() === normalizedPattern,
+			);
+			if (exactFullId !== undefined) return exactFullId;
+
+			const normalizedModelId = modelId.toLowerCase();
+			// Keep provider-qualified aliases scoped without changing registry order.
+			const fallbackModels =
+				provider === undefined
+					? models
+					: models.filter(
+							(model) =>
+								model.provider.toLowerCase() === provider.toLowerCase(),
+						);
+			const exactBareId = fallbackModels.find(
+				(model) => model.id.toLowerCase() === normalizedModelId,
+			);
+			if (exactBareId !== undefined) return exactBareId;
+
+			return fallbackModels.find(
+				(model) =>
+					model.id.toLowerCase().includes(normalizedModelId) ||
+					model.name?.toLowerCase().includes(normalizedModelId),
+			);
+		},
+		isAvailable(model: Model<Api>) {
+			return registry
+				.getAvailable()
+				.some(
+					(available) =>
+						available.provider === model.provider && available.id === model.id,
+				);
+		},
+		supportedThinkingLevels(model) {
+			return getSupportedThinkingLevelsCompat(model);
+		},
+	};
+}
+
+function makeCatalogPort(
+	ctx: Pick<ExtensionContext, "modelRegistry">,
+): ModelCatalogPort {
+	return makeModelCatalogPort(ctx.modelRegistry);
+}
+
+export function preflightValidateInvocations(
+	invocations: readonly AgentInvocation[],
+	port: ModelCatalogPort,
+): void {
+	for (const invocation of invocations) {
+		const result = validateResolvedModel(invocation.resolvedModel, port, {
+			agentName: invocation.agentName,
+		});
+		if (!result.ok) throw new Error(result.error);
+	}
+}
 
 // ── V2: Background Groups ──────────────────────────────────────────
 interface ChainStepDef {
@@ -438,6 +600,7 @@ interface ChainStepDef {
 	saveAs?: string;
 	mcps?: string[];
 	extensions?: string[];
+	readonly resolvedModel: ResolvedModelConfig;
 }
 
 interface BackgroundGroup {
@@ -459,7 +622,6 @@ interface BackgroundGroup {
 }
 
 const backgroundGroups = new Map<string, BackgroundGroup>();
-let piRef: ExtensionAPI | null = null;
 let bgWidgetInterval: ReturnType<typeof setInterval> | null = null;
 
 // UI context captured on session_start — used for widget updates
@@ -570,6 +732,26 @@ function writePromptToTempFile(agentName: string, prompt: string): { dir: string
 	const filePath = path.join(tmpDir, `prompt-${safeName}.md`);
 	fs.writeFileSync(filePath, prompt, { encoding: "utf-8", mode: 0o600 });
 	return { dir: tmpDir, filePath };
+}
+
+/**
+ * Build the resolved model and thinking-level flags shared by every child spawn.
+ * Model strings are normalized defensively so an embedded thinking suffix cannot
+ * produce duplicate or conflicting CLI signals.
+ */
+export function buildModelArgs(
+	resolved: Pick<ResolvedModelConfig, "model" | "thinkingLevel">,
+): string[] {
+	const normalized = resolved.model === undefined
+		? undefined
+		: normalizeModelString(resolved.model);
+	const effectiveThinkingLevel = resolved.thinkingLevel ?? normalized?.thinkingLevel;
+	const args: string[] = [];
+
+	if (normalized?.base) args.push("--model", normalized.base);
+	if (effectiveThinkingLevel) args.push("--thinking", effectiveThinkingLevel);
+
+	return args;
 }
 
 /**
@@ -718,9 +900,12 @@ async function runSingleAgent(
 		}
 	}
 
-	if (agent.model) args.push("--model", agent.model);
+	args.push(...buildModelArgs(invocation.resolvedModel));
 	args.push(...buildForegroundToolArgs(agent.tools));
 
+	const resultModel = invocation.resolvedModel.model === undefined
+		? agent.model
+		: invocation.resolvedModel.model;
 	let tmpPromptDir: string | null = null;
 	let tmpPromptPath: string | null = null;
 
@@ -734,7 +919,8 @@ async function runSingleAgent(
 		messages: [],
 		stderr: "",
 		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
-		model: agent.model,
+		...buildResolvedModelMetadata(invocation.resolvedModel),
+		model: resultModel === undefined ? undefined : normalizeModelString(resultModel).base,
 		step,
 		startTime: Date.now(),
 	};
@@ -945,6 +1131,7 @@ function resolveId(id: string):
 
 function buildBgSpawnArgs(
 	agentConfig: AgentConfig,
+	resolved: ResolvedModelConfig,
 	mcps?: string[],
 	runtimeExtensions?: string[],
 	teamName?: string,
@@ -973,7 +1160,7 @@ function buildBgSpawnArgs(
 	// Always load the bg-signal extension so __bg_signal is a real registered tool
 	args.push("-e", BG_SIGNAL_EXT_PATH);
 
-	if (agentConfig.model) args.push("--model", agentConfig.model);
+	args.push(...buildModelArgs(resolved));
 	args.push(...buildBackgroundToolArgs(agentConfig.tools));
 
 	return args;
@@ -1371,6 +1558,7 @@ function advanceChain(group: BackgroundGroup): void {
 			teamName: group.teamName,
 			previousOutput: group.previousOutput || "",
 			step: nextIndex + 1,
+			resolvedModel: stepDef.resolvedModel,
 		});
 	} catch (e: any) {
 		group.status = "error";
@@ -1385,7 +1573,7 @@ function advanceChain(group: BackgroundGroup): void {
 
 	const agentConfig = invocation.agent;
 	const memberId = generateMemberId(group.groupId, stepDef.agent, group.chainSteps.map((s) => s.agent));
-	const spawnArgs = buildBgSpawnArgs(agentConfig, stepDef.mcps, stepDef.extensions, group.teamName);
+	const spawnArgs = buildBgSpawnArgs(agentConfig, stepDef.resolvedModel, stepDef.mcps, stepDef.extensions, group.teamName);
 
 	const bgAgent: BackgroundAgent = {
 		id: memberId,
@@ -1405,6 +1593,7 @@ function advanceChain(group: BackgroundGroup): void {
 			messages: [],
 			stderr: "",
 			usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
+			...buildResolvedModelMetadata(stepDef.resolvedModel),
 			startTime: Date.now(),
 		},
 		status: "queued",
@@ -1449,11 +1638,10 @@ function evictCompletedGroups(): void {
 }
 
 function launchBackgroundParallel(
-	params: { tasks: Array<{ agent: string; task?: string; input?: unknown; cwd?: string; saveAs?: string; mcps?: string[]; extensions?: string[] }>; saveAs?: string; notifyPerTask?: boolean; background?: boolean },
-	agents: AgentConfig[],
+	params: { tasks: Array<{ agent: string; task?: string; input?: unknown; model?: string; thinkingLevel?: SubagentThinkingLevel; cwd?: string; saveAs?: string; mcps?: string[]; extensions?: string[] }>; saveAs?: string; notifyPerTask?: boolean; background?: boolean },
 	defaultCwd: string,
-	teamName?: string,
-	invocations?: AgentInvocation[],
+	teamName: string | undefined,
+	invocations: AgentInvocation[],
 ): { groupId: string; memberIds: string[]; queuedCount: number } {
 	const groupId = generateGroupId("parallel", params.saveAs);
 	const notifyPerTask = params.notifyPerTask !== false;
@@ -1475,11 +1663,11 @@ function launchBackgroundParallel(
 
 	for (let i = 0; i < params.tasks.length; i++) {
 		const t = params.tasks[i];
-		const invocation = invocations ? invocations[i] : resolveInvocation({ agents, spec: t, teamName });
+		const invocation = invocations[i];
 		const agentConfig = invocation.agent;
 
 		const memberId = generateMemberId(groupId, t.agent, allAgentNames);
-		const spawnArgs = buildBgSpawnArgs(agentConfig, invocation.mcps, invocation.extensions, teamName);
+		const spawnArgs = buildBgSpawnArgs(agentConfig, invocation.resolvedModel, invocation.mcps, invocation.extensions, teamName);
 
 		const runningCount = [...backgroundAgents.values()].filter((a) => a.status === "running" || a.status === "waiting").length;
 		const initialStatus = runningCount >= MAX_BG_CONCURRENCY ? "queued" as const : "running" as const;
@@ -1503,6 +1691,7 @@ function launchBackgroundParallel(
 				messages: [],
 				stderr: "",
 				usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
+				...buildResolvedModelMetadata(invocation.resolvedModel),
 				startTime: Date.now(),
 			},
 			status: initialStatus,
@@ -1539,12 +1728,37 @@ function launchBackgroundParallel(
 }
 
 function launchBackgroundChain(
-	params: { chain: Array<{ agent: string; task?: string; input?: unknown; cwd?: string; saveAs?: string; mcps?: string[]; extensions?: string[] }>; saveAs?: string; notifyPerTask?: boolean; background?: boolean },
+	params: { chain: Array<{ agent: string; task?: string; input?: unknown; model?: string; thinkingLevel?: SubagentThinkingLevel; cwd?: string; saveAs?: string; mcps?: string[]; extensions?: string[] }>; saveAs?: string; notifyPerTask?: boolean; background?: boolean },
 	agents: AgentConfig[],
 	defaultCwd: string,
-	teamName?: string,
-	firstInvocation?: AgentInvocation,
+	teamName: string | undefined,
+	firstInvocation: AgentInvocation,
+	stepResolvedModels: ResolvedModelConfig[],
 ): { groupId: string; firstMemberId: string } {
+	if (stepResolvedModels.length !== params.chain.length) {
+		throw new Error(
+			`Internal invariant violated: background chain received ${params.chain.length} steps but ${stepResolvedModels.length} resolved models.`,
+		);
+	}
+	const chainSteps = params.chain.map((step, index): ChainStepDef => {
+		const resolvedModel = stepResolvedModels[index];
+		if (!resolvedModel) {
+			throw new Error(
+				`Internal invariant violated: missing resolved model for background chain step ${index + 1} (${step.agent}).`,
+			);
+		}
+
+		return {
+			agent: step.agent,
+			task: step.task,
+			input: step.input,
+			cwd: step.cwd,
+			saveAs: step.saveAs,
+			mcps: step.mcps,
+			extensions: step.extensions,
+			resolvedModel,
+		};
+	});
 	const groupId = generateGroupId("chain", params.saveAs);
 	const notifyPerTask = params.notifyPerTask !== false;
 	const allAgentNames = params.chain.map((s) => s.agent);
@@ -1555,15 +1769,7 @@ function launchBackgroundChain(
 		memberIds: [],
 		status: "running",
 		startTime: Date.now(),
-		chainSteps: params.chain.map((s) => ({
-			agent: s.agent,
-			task: s.task,
-			input: s.input,
-			cwd: s.cwd,
-			saveAs: s.saveAs,
-			mcps: s.mcps,
-			extensions: s.extensions,
-		})),
+		chainSteps,
 		currentStepIndex: 0,
 		notifyPerTask,
 		teamName,
@@ -1574,11 +1780,11 @@ function launchBackgroundChain(
 	backgroundGroups.set(groupId, group);
 
 	const firstStep = params.chain[0];
-	const invocation = firstInvocation || resolveInvocation({ agents, spec: firstStep, teamName });
+	const invocation = firstInvocation;
 	const agentConfig = invocation.agent;
 
 	const memberId = generateMemberId(groupId, firstStep.agent, allAgentNames);
-	const spawnArgs = buildBgSpawnArgs(agentConfig, invocation.mcps, invocation.extensions, teamName);
+	const spawnArgs = buildBgSpawnArgs(agentConfig, invocation.resolvedModel, invocation.mcps, invocation.extensions, teamName);
 
 	const runningCount = [...backgroundAgents.values()].filter((a) => a.status === "running" || a.status === "waiting").length;
 	const initialStatus = runningCount >= MAX_BG_CONCURRENCY ? "queued" as const : "running" as const;
@@ -1601,6 +1807,7 @@ function launchBackgroundChain(
 			messages: [],
 			stderr: "",
 			usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
+			...buildResolvedModelMetadata(invocation.resolvedModel),
 			startTime: Date.now(),
 		},
 		status: initialStatus,
@@ -1744,10 +1951,17 @@ function shutdownAllBackgroundAgents(): void {
 	updateBgWidget();
 }
 
+const SubagentThinkingLevelSchema = StringEnum(
+	["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const,
+	{ description: "Reasoning level for the selected subagent model" },
+);
+
 const TaskItem = Type.Object({
 	agent: Type.String({ description: "Name of the agent to invoke" }),
 	task: Type.Optional(Type.String({ description: "Task to delegate to the agent" })),
 	input: Type.Optional(Type.Unknown({ description: "Structured input for parameterized agents" })),
+	model: Type.Optional(Type.String({ description: "Model override for this task" })),
+	thinkingLevel: Type.Optional(SubagentThinkingLevelSchema),
 	cwd: Type.Optional(Type.String({ description: "Working directory for the agent process" })),
 	saveAs: Type.Optional(
 		Type.String({ description: "Name for saved output in team mode (default: agent name, or agent-N for parallel)" }),
@@ -1772,6 +1986,8 @@ const ChainItem = Type.Object({
 	agent: Type.String({ description: "Name of the agent to invoke" }),
 	task: Type.Optional(Type.String({ description: "Task with optional {previous} placeholder for prior output" })),
 	input: Type.Optional(Type.Unknown({ description: "Structured input for parameterized agents. String values support {previous}." })),
+	model: Type.Optional(Type.String({ description: "Model override for this chain step" })),
+	thinkingLevel: Type.Optional(SubagentThinkingLevelSchema),
 	cwd: Type.Optional(Type.String({ description: "Working directory for the agent process" })),
 	saveAs: Type.Optional(
 		Type.String({ description: "Name for saved output in team mode (default: agent name)" }),
@@ -1812,6 +2028,8 @@ const SubagentParams = Type.Object({
 	agent: Type.Optional(Type.String({ description: "Name of the agent to invoke (for single mode)" })),
 	task: Type.Optional(Type.String({ description: "Task to delegate (for single mode)" })),
 	input: Type.Optional(Type.Unknown({ description: "Structured input for single mode" })),
+	model: Type.Optional(Type.String({ description: "Invocation-wide model override" })),
+	thinkingLevel: Type.Optional(SubagentThinkingLevelSchema),
 	tasks: Type.Optional(Type.Array(TaskItem, { description: "Array of {agent, task/input} for parallel execution" })),
 	chain: Type.Optional(Type.Array(ChainItem, { description: "Array of {agent, task/input} for sequential execution" })),
 	agentScope: Type.Optional(AgentScopeSchema),
@@ -1864,9 +2082,32 @@ export default function (pi: ExtensionAPI) {
 	piRef = pi;
 	// Register team coordination tools (TeamCreate, TaskCreate, SendMessage, etc.)
 	registerCoordinationTools(pi);
+	registerAgentModelCommand(pi, {
+		// Security boundary: deliberately exclude repo-controlled project agents;
+		// /agent-model manages personal user/bundled defaults, not project policy.
+		discover: (ctx) =>
+			resolveScopeDiscovery({ agentScope: "user" }, ctx.cwd).agents,
+		getSessionOverrides: () => sessionModelOverrides,
+		setSessionOverride(agent, override) {
+			const updated = computeUpdatedOverrides(
+				sessionModelOverrides,
+				agent,
+				override,
+			);
+			appendSessionOverridesSnapshot(pi.appendEntry.bind(pi), updated);
+			sessionModelOverrides = updated;
+		},
+		loadGlobal: loadGlobalConfig,
+		saveGlobal: saveGlobalOverride,
+		resetGlobal: resetGlobalOverride,
+		makePort: makeCatalogPort,
+		parentFor: parentModelForContext,
+		buildEffectiveConfig,
+	});
 
 	// Capture UI context for widget updates
 	pi.on("session_start", (_event, ctx) => {
+		sessionModelOverrides = restoreSessionOverrides(ctx.sessionManager.getBranch());
 		if (ctx.hasUI) {
 			uiSetWidget = ctx.ui.setWidget.bind(ctx.ui);
 		}
@@ -1880,15 +2121,37 @@ export default function (pi: ExtensionAPI) {
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			const scope = params.agentScope ?? "user";
 			const discovery = resolveScopeDiscovery(params, ctx.cwd);
+			const {
+				config: globalModelConfig,
+				error: globalModelConfigError,
+			} = loadGlobalConfig();
+			const parentModelOverride = parentModelForContext(ctx);
 
 			const agents = [...discovery.agents].sort((a, b) => a.name.localeCompare(b.name));
-
-			const compactAgents = agents.map(buildCompactAgentInfo);
+			const compactAgents = agents.map((agent) => {
+				const effective = buildEffectiveConfig(agent, {
+					session: sessionModelOverrides[agent.name],
+					global: globalModelConfig[agent.name],
+					parent: parentModelOverride,
+				});
+				return {
+					...buildCompactAgentInfo(agent),
+					effective: {
+						model: effective.model,
+						thinkingLevel: effective.thinkingLevel,
+						source: effective.source,
+					},
+				};
+			});
+			const diagnostics = [...discovery.diagnostics];
+			if (globalModelConfigError !== undefined) {
+				diagnostics.push(globalModelConfigError);
+			}
 			const payload = {
 				agentScope: scope,
 				count: compactAgents.length,
 				agents: compactAgents,
-				diagnostics: discovery.diagnostics,
+				diagnostics,
 			};
 
 			return {
@@ -1906,6 +2169,11 @@ export default function (pi: ExtensionAPI) {
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			const scope = params.agentScope ?? "user";
 			const discovery = resolveScopeDiscovery(params, ctx.cwd);
+			const {
+				config: globalModelConfig,
+				error: globalModelConfigError,
+			} = loadGlobalConfig();
+			const parentModelOverride = parentModelForContext(ctx);
 
 			const agent = discovery.agents.find(a => a.name === params.agent);
 			if (!agent) {
@@ -1914,7 +2182,22 @@ export default function (pi: ExtensionAPI) {
 				throw new Error(`Agent "${params.agent}" not found.${hint} Available agents: ${available}`);
 			}
 
-			const payload = buildFullAgentContract(agent);
+			const effective = buildEffectiveConfig(agent, {
+				session: sessionModelOverrides[agent.name],
+				global: globalModelConfig[agent.name],
+				parent: parentModelOverride,
+			});
+			const payload = {
+				...buildFullAgentContract(agent),
+				effective: {
+					model: effective.model,
+					thinkingLevel: effective.thinkingLevel,
+					source: effective.source,
+				},
+				...(globalModelConfigError === undefined
+					? {}
+					: { configError: globalModelConfigError }),
+			};
 			return {
 				content: [{ type: "text", text: formatJson(payload) }],
 				details: payload,
@@ -1937,6 +2220,25 @@ export default function (pi: ExtensionAPI) {
 		parameters: SubagentParams,
 
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
+			const {
+				config: globalModelConfig,
+				error: globalModelConfigError,
+			} = loadGlobalConfig();
+			if (globalModelConfigError !== undefined) throw new Error(globalModelConfigError);
+			const catalogPort = makeCatalogPort(ctx);
+			const invocationModelOverride: AgentModelOverride = {
+				model: params.model,
+				thinkingLevel: params.thinkingLevel,
+			};
+			const parentModelOverride = parentModelForContext(ctx);
+			const modelResolutionFor = (agentName: string) =>
+				buildModelResolution(
+					agentName,
+					invocationModelOverride,
+					globalModelConfig[agentName],
+					parentModelOverride,
+				);
+
 			const agentScope: AgentScope = params.agentScope ?? "user";
 			const discovery = resolveScopeDiscovery(params, ctx.cwd);
 			const agents = discovery.agents;
@@ -2009,10 +2311,18 @@ export default function (pi: ExtensionAPI) {
 
 			// ── V2: Background parallel ──
 			if (params.background && hasTasks) {
-				const invocations = params.tasks!.map(t => resolveInvocation({ agents, spec: t, teamName }));
+				const invocations = params.tasks!.map((t) =>
+					resolveInvocation({
+						agents,
+						spec: t,
+						teamName,
+						modelResolution: modelResolutionFor(t.agent),
+					}),
+				);
+				preflightValidateInvocations(invocations, catalogPort);
 				const { groupId, memberIds, queuedCount } = launchBackgroundParallel(
 					{ tasks: params.tasks!, saveAs: params.saveAs, notifyPerTask: params.notifyPerTask },
-					agents, ctx.cwd, teamName,
+					ctx.cwd, teamName,
 					invocations
 				);
 				const runningCount = memberIds.length - queuedCount;
@@ -2031,15 +2341,32 @@ export default function (pi: ExtensionAPI) {
 			// ── V2: Background chain ──
 			if (params.background && hasChain) {
 				// Preflight all steps with empty previousOutput to catch early errors
-				for (let i = 0; i < params.chain!.length; i++) {
-					resolveInvocation({ agents, spec: params.chain![i], teamName, previousOutput: "", isPreflight: true });
-				}
+				const preflightInvocations = params.chain!.map((step) =>
+					resolveInvocation({
+						agents,
+						spec: step,
+						teamName,
+						previousOutput: "",
+						isPreflight: true,
+						modelResolution: modelResolutionFor(step.agent),
+					}),
+				);
+				preflightValidateInvocations(preflightInvocations, catalogPort);
+				const stepResolvedModels = preflightInvocations.map(
+					(invocation) => invocation.resolvedModel,
+				);
 
-				const firstInvocation = resolveInvocation({ agents, spec: params.chain![0], teamName });
+				const firstInvocation = resolveInvocation({
+					agents,
+					spec: params.chain![0],
+					teamName,
+					resolvedModel: stepResolvedModels[0],
+				});
 				const { groupId, firstMemberId } = launchBackgroundChain(
 					{ chain: params.chain!, saveAs: params.saveAs, notifyPerTask: params.notifyPerTask },
 					agents, ctx.cwd, teamName,
-					firstInvocation
+					firstInvocation,
+					stepResolvedModels,
 				);
 				return {
 					content: [{
@@ -2055,9 +2382,17 @@ export default function (pi: ExtensionAPI) {
 
 			if (params.chain && params.chain.length > 0) {
 				// Preflight all steps
-				for (let i = 0; i < params.chain.length; i++) {
-					resolveInvocation({ agents, spec: params.chain[i], teamName, previousOutput: "", isPreflight: true });
-				}
+				const preflightInvocations = params.chain.map((step) =>
+					resolveInvocation({
+						agents,
+						spec: step,
+						teamName,
+						previousOutput: "",
+						isPreflight: true,
+						modelResolution: modelResolutionFor(step.agent),
+					}),
+				);
+				preflightValidateInvocations(preflightInvocations, catalogPort);
 
 				const results: SingleResult[] = [];
 				let previousOutput: string | undefined = undefined;
@@ -2070,6 +2405,7 @@ export default function (pi: ExtensionAPI) {
 						teamName,
 						previousOutput,
 						step: i + 1,
+						modelResolution: modelResolutionFor(step.agent),
 					});
 
 					// Create update callback that includes all previous results
@@ -2124,7 +2460,9 @@ export default function (pi: ExtensionAPI) {
 					agents,
 					spec: { ...t, saveAs: t.saveAs || (params.tasks!.length > 1 ? `${t.agent}-${index + 1}` : t.agent) },
 					teamName,
+					modelResolution: modelResolutionFor(t.agent),
 				}));
+				preflightValidateInvocations(invocations, catalogPort);
 
 				// Initialize placeholder results
 				for (let i = 0; i < params.tasks.length; i++) {
@@ -2138,6 +2476,7 @@ export default function (pi: ExtensionAPI) {
 						messages: [],
 						stderr: "",
 						usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
+						...buildResolvedModelMetadata(invocations[i].resolvedModel),
 						startTime: Date.now(),
 					};
 				}
@@ -2214,14 +2553,16 @@ export default function (pi: ExtensionAPI) {
 						extensions: params.extensions,
 					},
 					teamName,
+					modelResolution: modelResolutionFor(params.agent),
 				});
+				preflightValidateInvocations([invocation], catalogPort);
 
 				// ── Background mode ──
 				if (params.background) {
 					const jobId = generateBgId(invocation.agentName, invocation.saveAs);
 
 					// Build spawn args (same as runSingleAgent but --mode rpc)
-					const spawnArgs = buildBgSpawnArgs(invocation.agent, invocation.mcps, invocation.extensions, teamName);
+					const spawnArgs = buildBgSpawnArgs(invocation.agent, invocation.resolvedModel, invocation.mcps, invocation.extensions, teamName);
 
 					// Check concurrency
 					const runningCount = [...backgroundAgents.values()].filter(
@@ -2246,6 +2587,7 @@ export default function (pi: ExtensionAPI) {
 							messages: [],
 							stderr: "",
 							usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
+							...buildResolvedModelMetadata(invocation.resolvedModel),
 							startTime: Date.now(),
 						},
 						status: runningCount >= MAX_BG_CONCURRENCY ? "queued" : "running",
@@ -2439,9 +2781,11 @@ export default function (pi: ExtensionAPI) {
 							container.addChild(new Markdown(finalOutput.trim(), 0, 0, mdTheme));
 						}
 					}
-					const usageStr = formatUsageStats(r.usage, r.model, {
+					const usageStr = formatUsageStats(r.usage, r.model ?? r.resolvedModel, {
 						provider: r.provider,
 						elapsedMs: Date.now() - r.startTime,
+						thinkingLevel: r.resolvedThinkingLevel,
+						source: r.configSource,
 					});
 					if (usageStr) {
 						container.addChild(new Spacer(1));
@@ -2460,9 +2804,11 @@ export default function (pi: ExtensionAPI) {
 					text += `\n${renderDisplayItems(displayItems, COLLAPSED_ITEM_COUNT)}`;
 					if (displayItems.length > COLLAPSED_ITEM_COUNT) text += `\n${theme.fg("muted", "(Ctrl+O to expand)")}`;
 				}
-				const usageStr = formatUsageStats(r.usage, r.model, {
+				const usageStr = formatUsageStats(r.usage, r.model ?? r.resolvedModel, {
 					provider: r.provider,
 					elapsedMs: Date.now() - r.startTime,
+					thinkingLevel: r.resolvedThinkingLevel,
+					source: r.configSource,
 				});
 				if (usageStr) text += `\n${theme.fg("dim", usageStr)}`;
 				return new Text(text, 0, 0);
@@ -2538,9 +2884,11 @@ export default function (pi: ExtensionAPI) {
 							container.addChild(new Markdown(finalOutput.trim(), 0, 0, mdTheme));
 						}
 
-						const stepUsage = formatUsageStats(r.usage, r.model, {
+						const stepUsage = formatUsageStats(r.usage, r.model ?? r.resolvedModel, {
 							provider: r.provider,
 							elapsedMs: Date.now() - r.startTime,
+							thinkingLevel: r.resolvedThinkingLevel,
+							source: r.configSource,
 						});
 						if (stepUsage) container.addChild(new Text(theme.fg("dim", stepUsage), 0, 0));
 					}
@@ -2631,9 +2979,11 @@ export default function (pi: ExtensionAPI) {
 							container.addChild(new Markdown(finalOutput.trim(), 0, 0, mdTheme));
 						}
 
-						const taskUsage = formatUsageStats(r.usage, r.model, {
+						const taskUsage = formatUsageStats(r.usage, r.model ?? r.resolvedModel, {
 							provider: r.provider,
 							elapsedMs: Date.now() - r.startTime,
+							thinkingLevel: r.resolvedThinkingLevel,
+							source: r.configSource,
 						});
 						if (taskUsage) container.addChild(new Text(theme.fg("dim", taskUsage), 0, 0));
 					}
@@ -2841,9 +3191,11 @@ export default function (pi: ExtensionAPI) {
 					.filter((m) => m.role === "assistant")
 					.flatMap((m) => m.content.filter((p: any) => p.type === "toolCall").map((p: any) => p.name))
 					.slice(-5);
-				const usageStr = formatUsageStats(bgAgent.result.usage, bgAgent.result.model, {
+				const usageStr = formatUsageStats(bgAgent.result.usage, bgAgent.result.model ?? bgAgent.result.resolvedModel, {
 					provider: bgAgent.result.provider,
 					elapsedMs,
+					thinkingLevel: bgAgent.result.resolvedThinkingLevel,
+					source: bgAgent.result.configSource,
 				});
 
 				return {

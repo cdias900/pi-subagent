@@ -1,5 +1,12 @@
 import { describe, it, expect } from "vitest";
+import extension from "./index.js";
 import { summarizeParameters, buildExampleInput } from "./parameters.js";
+
+describe("extension entrypoint smoke", () => {
+	it("loads the extension entrypoint as a function", () => {
+		expect(extension).toBeTypeOf("function");
+	});
+});
 
 describe("parameters smoke", () => {
 	const schema = {

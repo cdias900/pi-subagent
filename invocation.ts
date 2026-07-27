@@ -8,6 +8,10 @@ import {
 	buildExampleInput,
 } from "./parameters.js";
 import type { ValidationIssue } from "./parameters.js";
+import type { AgentModelOverride } from "./model-config.js";
+import type { SubagentThinkingLevel } from "./model-normalize.js";
+import { resolveModelLayers } from "./model-resolution.js";
+import type { ResolvedModelConfig } from "./model-resolution.js";
 import { buildTeamTask, expandOutputPlaceholders, loadSharedContext } from "./team.js";
 
 export type PromptKind = "task" | "input";
@@ -20,6 +24,8 @@ export interface InvocationSpec {
 	saveAs?: string;
 	mcps?: string[];
 	extensions?: string[];
+	model?: string;
+	thinkingLevel?: SubagentThinkingLevel;
 }
 
 export interface AgentInvocation {
@@ -28,6 +34,7 @@ export interface AgentInvocation {
 	promptKind: PromptKind;
 	prompt: string;
 	display: string;
+	resolvedModel: ResolvedModelConfig;
 	task?: string;
 	input?: unknown;
 	cwd?: string;
@@ -48,6 +55,13 @@ export function resolveInvocation(args: {
 	previousOutput?: string;
 	step?: number;
 	isPreflight?: boolean;
+	modelResolution?: {
+		invocation?: AgentModelOverride;
+		session?: AgentModelOverride;
+		global?: AgentModelOverride;
+		parent?: AgentModelOverride;
+	};
+	resolvedModel?: ResolvedModelConfig;
 }): AgentInvocation {
 	const { agents, spec, teamName, previousOutput, step, isPreflight } = args;
 
@@ -121,12 +135,40 @@ export function resolveInvocation(args: {
 		display = truncateForDisplay(spec.task!.replace(/\{previous\}/g, "").trim(), MAX_DISPLAY_CHARS);
 	}
 
+	const resolvedModel = args.resolvedModel ?? resolveModelLayers({
+		parent: args.modelResolution?.parent,
+		layers: [
+			{ model: agent.model, source: "frontmatter" },
+			{
+				model: args.modelResolution?.global?.model,
+				thinkingLevel: args.modelResolution?.global?.thinkingLevel,
+				source: "global",
+			},
+			{
+				model: args.modelResolution?.session?.model,
+				thinkingLevel: args.modelResolution?.session?.thinkingLevel,
+				source: "session",
+			},
+			{
+				model: args.modelResolution?.invocation?.model,
+				thinkingLevel: args.modelResolution?.invocation?.thinkingLevel,
+				source: "invocation",
+			},
+			{
+				model: spec.model,
+				thinkingLevel: spec.thinkingLevel,
+				source: "task",
+			},
+		],
+	});
+
 	return {
 		agent,
 		agentName: agent.name,
 		promptKind,
 		prompt,
 		display,
+		resolvedModel,
 		task: spec.task,
 		input: finalInput,
 		cwd: spec.cwd,
