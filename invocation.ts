@@ -83,21 +83,22 @@ export function resolveInvocation(args: {
 	let finalInput = spec.input;
 
 	if (hasInput) {
+		const coercedInput = coerceJsonStringInput(spec.input);
 		if (isPreflight) {
-			finalInput = deepCopyAndExpand(spec.input, teamName, undefined);
+			finalInput = deepCopyAndExpand(coercedInput, teamName, undefined);
 			const serializedInput = formatJson(finalInput);
 			if (serializedInput.length > MAX_PARAMETERIZED_INPUT_CHARS) {
 				throw new Error(`Agent input exceeds maximum size of ${MAX_PARAMETERIZED_INPUT_CHARS} characters.`);
 			}
 			const issues = validateAgentInput(agent.parameters!, finalInput);
-			const staticIssues = issues.filter(i => !shouldSuppressPreflightIssue(spec.input, i));
+			const staticIssues = issues.filter(i => !shouldSuppressPreflightIssue(coercedInput, i));
 			if (staticIssues.length > 0) {
 				throw new Error(formatInputValidationError(agent, finalInput, staticIssues));
 			}
 			prompt = buildTypedPrompt(agent, finalInput, teamName);
 			display = truncateForDisplay(displayInputSummary(finalInput), MAX_DISPLAY_CHARS);
 		} else {
-			finalInput = deepCopyAndExpand(spec.input, teamName, previousOutput);
+			finalInput = deepCopyAndExpand(coercedInput, teamName, previousOutput);
 			const serializedInput = formatJson(finalInput);
 			if (serializedInput.length > MAX_PARAMETERIZED_INPUT_CHARS) {
 				throw new Error(`Agent input exceeds maximum size of ${MAX_PARAMETERIZED_INPUT_CHARS} characters.`);
@@ -191,6 +192,34 @@ function shouldSuppressPreflightIssue(input: unknown, issue: ValidationIssue): b
 		current = current[p];
 	}
 	return typeof current === "string" && current.includes("{previous}");
+}
+
+/**
+ * Coerce a root-level JSON-string input into a plain object.
+ *
+ * `normalizeParametersSchema` guarantees every agent schema is a root
+ * `type: object`, so a string input can never validate on its own.
+ * When a caller passes a stringified JSON object as `input`, parse it here
+ * (root level only — never recurse) so downstream validation, prompt
+ * construction, and `{previous}` placeholder expansion operate on the parsed
+ * object rather than raw JSON text. Malformed JSON or non-object parses
+ * (arrays, primitives, null) fall through unchanged and surface the normal
+ * root-type validation error.
+ */
+function coerceJsonStringInput(input: unknown): unknown {
+	if (typeof input !== "string") return input;
+	const trimmed = input.trim();
+	if (trimmed === "") return input;
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(trimmed);
+	} catch {
+		return input;
+	}
+	if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) {
+		return parsed;
+	}
+	return input;
 }
 
 function deepCopyAndExpand(val: unknown, teamName?: string, previousOutput?: string): unknown {

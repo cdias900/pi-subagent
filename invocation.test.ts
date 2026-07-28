@@ -631,3 +631,110 @@ describe("displayInputSummary", () => {
 		expect(displayInputSummary(null)).toBe("null");
 	});
 });
+
+// ── JSON-string input coercion ─────────────────────────────────────────
+
+describe("resolveInvocation — JSON-string input coercion", () => {
+	const agent = makeParameterizedAgent();
+
+	it("accepts a stringified valid object and parses it into an object", () => {
+		const result = invoke([agent], {
+			agent: agent.name,
+			input: JSON.stringify({ name: "alice", count: 3 }),
+		});
+		expect(result.promptKind).toBe("input");
+		expect(result.input).toEqual({ name: "alice", count: 3 });
+		expect(typeof result.input).toBe("object");
+		expect(result.input).not.toBeNull();
+	});
+
+	it("typed prompt contains the parsed JSON values", () => {
+		const result = invoke([agent], {
+			agent: agent.name,
+			input: JSON.stringify({ name: "alice", count: 3 }),
+		});
+		expect(result.prompt).toContain("```json");
+		expect(result.prompt).toContain('"name": "alice"');
+		expect(result.prompt).toContain('"count": 3');
+	});
+
+	it("malformed JSON string still throws 'Input validation failed' with 'must be object'", () => {
+		expectThrow(
+			[agent],
+			{ agent: agent.name, input: "{not valid json" },
+			"Input validation failed",
+		);
+		try {
+			invoke([agent], { agent: agent.name, input: "{not valid json" });
+		} catch (err: any) {
+			expect(err.message).toContain("must be object");
+		}
+	});
+
+	it("stringified array '[1,2]' still throws a root type error", () => {
+		expectThrow(
+			[agent],
+			{ agent: agent.name, input: "[1,2]" },
+			"Input validation failed",
+		);
+		try {
+			invoke([agent], { agent: agent.name, input: "[1,2]" });
+		} catch (err: any) {
+			expect(err.message).toContain("must be object");
+		}
+	});
+
+	it("stringified primitive '42' still throws a root type error", () => {
+		expectThrow(
+			[agent],
+			{ agent: agent.name, input: "42" },
+			"Input validation failed",
+		);
+		try {
+			invoke([agent], { agent: agent.name, input: "42" });
+		} catch (err: any) {
+			expect(err.message).toContain("must be object");
+		}
+	});
+
+	it("native object with a nested JSON-looking string value is NOT double-parsed", () => {
+		const result = invoke([agent], {
+			agent: agent.name,
+			input: { name: '{"inner":"value"}' },
+		});
+		expect(result.input).toEqual({ name: '{"inner":"value"}' });
+		expect(typeof (result.input as any).name).toBe("string");
+	});
+
+	it("parses stringified input containing {previous} before expanding placeholders", () => {
+		const result = resolveInvocation({
+			agents: [agent],
+			spec: { agent: agent.name, input: '{"name":"{previous}"}' },
+			previousOutput: 'hello "world"',
+		});
+		expect(result.input).toEqual({ name: 'hello "world"' });
+		expect(typeof result.input).toBe("object");
+	});
+
+	it("preflight with stringified input containing {previous} suppresses correctly", () => {
+		// Schema with a pattern constraint that {previous} violates, so the
+		// preflight issue at /name should be suppressed (value is a string
+		// containing {previous}).
+		const patternAgent = makeParameterizedAgent({
+			parameters: {
+				type: "object",
+				required: ["name"],
+				properties: {
+					name: { type: "string", pattern: "^[a-z]+$" },
+				},
+			},
+		});
+		const result = resolveInvocation({
+			agents: [patternAgent],
+			spec: { agent: patternAgent.name, input: '{"name":"{previous}"}' },
+			isPreflight: true,
+		});
+		expect(result.promptKind).toBe("input");
+		expect(result.input).toEqual({ name: "{previous}" });
+	});
+});
