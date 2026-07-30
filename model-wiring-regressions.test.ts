@@ -190,7 +190,7 @@ describe("foreground model resolution wiring", () => {
 		);
 		expect(SUBAGENT_EXECUTE).not.toContain("loadGlobalConfig().config");
 		expect(SUBAGENT_EXECUTE).toMatch(
-			/if\s*\(globalModelConfigError\s*!==\s*undefined\)\s*throw new Error\(globalModelConfigError\)/,
+			/if\s*\(globalModelConfigError\s*!==\s*undefined\)\s*throw new Error\(formatGlobalConfigDispatchError\(globalModelConfigError\)\)/,
 		);
 		const configErrorGuard = SUBAGENT_EXECUTE.indexOf(
 			"if (globalModelConfigError !== undefined)",

@@ -11,6 +11,7 @@ import {
 import type { AgentConfig } from "./agents.js";
 import {
 	type AgentModelOverride,
+	type ForceResetResult,
 	type LoadResult,
 	type SubagentModelConfig,
 } from "./model-config.js";
@@ -40,12 +41,18 @@ export type ParsedAgentModelCommand =
 			thinkingLevel: SubagentThinkingLevel | undefined;
 	  }
 	| { kind: "reset"; scope: AgentModelScope; agent: string }
+	| { kind: "forceReset" }
 	| { kind: "error"; message: string };
 
 interface EffectiveConfigOptions {
 	session?: AgentModelOverride;
 	global?: AgentModelOverride;
 	parent?: AgentModelOverride;
+}
+
+interface EffectiveConfigOutcome {
+	effective: ResolvedModelConfig;
+	globalError: string | undefined;
 }
 
 export interface AgentModelCommandDeps {
@@ -61,6 +68,7 @@ export interface AgentModelCommandDeps {
 		override: AgentModelOverride,
 	): void | Promise<void>;
 	resetGlobal(agent: string): void | Promise<void>;
+	forceResetGlobal(): ForceResetResult;
 	makePort(ctx: ExtensionCommandContext): ModelCatalogPort;
 	parentFor(ctx: ExtensionCommandContext): AgentModelOverride;
 	buildEffectiveConfig(
@@ -77,6 +85,7 @@ const USAGE = [
 	"  /agent-model global <agent> <provider/model> [level]",
 	"  /agent-model session <agent> reset",
 	"  /agent-model global <agent> reset",
+	"  /agent-model global reset --force",
 	`Valid levels: ${CANONICAL_THINKING_LEVELS.join(", ")}`,
 ].join("\n");
 
@@ -112,6 +121,24 @@ export function parseAgentModelArgs(argStr: string): ParsedAgentModelCommand {
 
 	const agent = tokens[1];
 	const modelOrReset = tokens[2];
+
+	// Full-global force reset: /agent-model global reset --force
+	// Distinct from the per-agent reset form (global <agent> reset): this resets
+	// the entire global config without parsing it, to recover from corruption.
+	if (agent === "reset") {
+		if (first !== "global") {
+			return errorWithUsage(
+				"The full-config reset form is only valid for the global scope.",
+			);
+		}
+		if (tokens.length === 3 && modelOrReset === "--force") {
+			return { kind: "forceReset" };
+		}
+		return errorWithUsage(
+			'Use "/agent-model global reset --force" to reset the entire global configuration.',
+		);
+	}
+
 	if (modelOrReset === "reset") {
 		if (tokens.length !== 3) {
 			return errorWithUsage("The reset form does not accept extra arguments.");
@@ -153,11 +180,6 @@ function getExtensionMode(ctx: ExtensionCommandContext): ExtensionMode | undefin
 
 function errorMessage(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
-}
-
-function ensureGlobalConfig(loadResult: LoadResult): SubagentModelConfig {
-	if (loadResult.error !== undefined) throw new Error(loadResult.error);
-	return loadResult.config;
 }
 
 function withOverride(
@@ -258,9 +280,19 @@ function effectiveConfigForChange(
 	override: AgentModelOverride | undefined,
 	ctx: ExtensionCommandContext,
 	deps: AgentModelCommandDeps,
-): ResolvedModelConfig {
+): EffectiveConfigOutcome {
 	const session = deps.getSessionOverrides();
-	const global = ensureGlobalConfig(deps.loadGlobal());
+	const globalLoad = deps.loadGlobal();
+
+	// Global-scope writes must merge into the existing file, so fail closed on a
+	// corrupt global config — the user should run /agent-model global reset --force.
+	if (scope === "global" && globalLoad.error !== undefined) {
+		throw new Error(globalLoad.error);
+	}
+
+	// Session-scope writes tolerate a corrupt global file: ignore its defaults
+	// and surface the problem as a non-fatal warning after the write succeeds.
+	const global = globalLoad.error !== undefined ? {} : globalLoad.config;
 	const nextSession =
 		scope === "session"
 			? withOverride(session, agent.name, override)
@@ -270,11 +302,12 @@ function effectiveConfigForChange(
 			? withOverride(global, agent.name, override)
 			: global;
 
-	return deps.buildEffectiveConfig(agent, {
+	const effective = deps.buildEffectiveConfig(agent, {
 		session: nextSession[agent.name],
 		global: nextGlobal[agent.name],
 		parent: deps.parentFor(ctx),
 	});
+	return { effective, globalError: globalLoad.error };
 }
 
 async function persistChange(
@@ -285,7 +318,13 @@ async function persistChange(
 	deps: AgentModelCommandDeps,
 ): Promise<void> {
 	// Resolve every fallible config dependency before the single scoped write.
-	const effective = effectiveConfigForChange(agent, scope, override, ctx, deps);
+	const { effective, globalError } = effectiveConfigForChange(
+		agent,
+		scope,
+		override,
+		ctx,
+		deps,
+	);
 
 	if (scope === "session") {
 		await deps.setSessionOverride(agent.name, override);
@@ -296,6 +335,13 @@ async function persistChange(
 	}
 
 	ctx.ui.notify(successMessage(agent.name, scope, effective), "info");
+
+	if (scope === "session" && globalError !== undefined) {
+		ctx.ui.notify(
+			`Warning: the global subagent model config is unreadable (${globalError}). The session override was applied, but global defaults were ignored. Run \`/agent-model global reset --force\` to repair the global config.`,
+			"warning",
+		);
+	}
 }
 
 function formatEffectiveConfigRow(
@@ -422,7 +468,14 @@ async function handleGuided(
 	}
 
 	const session = deps.getSessionOverrides();
-	const global = ensureGlobalConfig(deps.loadGlobal());
+	const globalLoad = deps.loadGlobal();
+	const global = globalLoad.error !== undefined ? {} : globalLoad.config;
+	if (globalLoad.error !== undefined) {
+		ctx.ui.notify(
+			`Warning: the global subagent model config is unreadable (${globalLoad.error}). Global defaults will be ignored for this selection. Run \`/agent-model global reset --force\` to repair the global config.`,
+			"warning",
+		);
+	}
 	const parent = deps.parentFor(ctx);
 	let agent: AgentConfig | undefined;
 
@@ -540,6 +593,30 @@ export function registerAgentModelCommand(
 			const parsed = parseAgentModelArgs(args ?? "");
 			if (parsed.kind === "error") {
 				ctx.ui.notify(parsed.message, "warning");
+				return;
+			}
+
+			if (parsed.kind === "forceReset") {
+				try {
+					const result = deps.forceResetGlobal();
+					const lines = [
+						"Global subagent model configuration reset.",
+						`Recovered: ${result.recoveredPath}`,
+					];
+					if (result.backupPath !== undefined) {
+						lines.push(`Backup of corrupt file: ${result.backupPath}`);
+					} else {
+						lines.push(
+							"No existing file was found; wrote a clean empty configuration.",
+						);
+					}
+					ctx.ui.notify(lines.join("\n"), "info");
+				} catch (error) {
+					ctx.ui.notify(
+						`Unable to force-reset global configuration: ${errorMessage(error)}`,
+						"error",
+					);
+				}
 				return;
 			}
 

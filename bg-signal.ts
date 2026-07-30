@@ -25,6 +25,7 @@ export default function bgSignalExtension(pi: ExtensionAPI) {
 			// We just return a success so the child LLM doesn't see an error.
 			return {
 				content: [{ type: "text", text: `Signal acknowledged: ${params.status}` }],
+				details: {},
 			};
 		},
 	});

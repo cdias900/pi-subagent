@@ -321,6 +321,38 @@ task > invocation > session > global > frontmatter > parent
 - Canonical levels are `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, and `max`.
 - Supported levels depend on the model. Non-reasoning models accept only `off`, and extended levels such as `xhigh` or `max` are available only when the model supports them.
 
+#### Suffix collision with `:off` and `:max`
+
+The set of trailing suffixes stripped and interpreted as reasoning levels was
+extended by this PR. The five previously recognized tokens were `minimal`,
+`low`, `medium`, `high`, and `xhigh`. The canonical set is now seven — `off`
+and `max` were added — so `:off` and `:max` are now also stripped from a model
+id and treated as reasoning levels.
+
+This introduces a **suffix collision** that is syntactically undetectable: the
+parser cannot distinguish a model tag from a reasoning level. A model id that
+legitimately ends in `:off` or `:max` is now silently rewritten.
+
+For example, an Ollama-style tag id such as `ollama/qwen:max`:
+
+- **Before this PR** — passed through verbatim as a single `--model` value:
+  `--model ollama/qwen:max`
+- **After this PR** — split into a base id and a reasoning level:
+  `--model ollama/qwen --thinking max`
+
+**Practical impact:** if you use a model whose id genuinely ends in `:off` or
+`:max`, pi-subagent will now dispatch a different model than the one you named
+and pass an unintended `--thinking` level, with no warning. The collision
+cannot be detected at parse time because the suffix is identical to a valid
+reasoning token.
+
+If a model ID genuinely ends in `:off` or `:max`, it cannot currently be
+represented through pi-subagent's `model` field, because every model value
+passes through the same suffix parser. Use a different model tag or alias that
+does not end in a canonical reasoning token. For non-colliding model IDs,
+prefer the separate `thinkingLevel` field instead of encoding reasoning in the
+model ID.
+
 ### Per-Run Overrides
 
 Top-level fields apply to the whole invocation. Fields on a parallel task or chain step override them for that item. Replace the example IDs with exact models available in PI.

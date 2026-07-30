@@ -4,6 +4,8 @@ import * as os from "node:os";
 import * as path from "node:path";
 import {
 	GLOBAL_CONFIG_FILENAME,
+	formatGlobalConfigDispatchError,
+	forceResetGlobalConfig,
 	loadGlobalConfig,
 	resetGlobalOverride,
 	saveGlobalOverride,
@@ -80,6 +82,22 @@ describe("validateSubagentModelConfig", () => {
 			error: 'model for agent "scout" must be a string',
 		});
 	});
+
+	it.each([
+		["empty string", ""],
+		["whitespace-only", "   \t  "],
+	])(
+		"rejects a %s model at the validation boundary",
+		(_label, model) => {
+			expect(
+				validateSubagentModelConfig({ scout: { model } }),
+			).toEqual({
+				valid: false,
+				error:
+					'model for agent "scout" must not be empty or whitespace-only',
+			});
+		},
+	);
 });
 
 describe("global subagent model config", () => {
@@ -199,6 +217,20 @@ describe("global subagent model config", () => {
 				'model for agent "scout" must be a string',
 			);
 		});
+
+		it.each([
+			["empty string", '""'],
+			["whitespace-only", '"   "'],
+		])(
+			"rejects a %s model from a config file without changing the file",
+			(_label, model) => {
+				expectRejectedWithoutWrite(
+					configPath,
+					`{"scout":{"model":${model}}}`,
+					'model for agent "scout" must not be empty or whitespace-only',
+				);
+			},
+		);
 
 		it.each([
 			["unknown string", '"ultra"'],
@@ -426,6 +458,119 @@ describe("global subagent model config", () => {
 
 			expect(fs.existsSync(configPath)).toBe(false);
 			expect(fs.existsSync(path.dirname(configPath))).toBe(false);
+		});
+	});
+
+	describe("forceResetGlobalConfig", () => {
+		it("backs up the corrupt bytes verbatim and writes a clean empty config", () => {
+			const corruptBytes = Buffer.from('{"scout":{"model":');
+			writeBytes(configPath, corruptBytes);
+
+			const result = forceResetGlobalConfig(configPath);
+
+			expect(result.recoveredPath).toBe(configPath);
+			expect(result.backupPath).toBeDefined();
+			expect(result.backupPath!.startsWith(`${configPath}.corrupt-`)).toBe(true);
+			expect(readBytes(result.backupPath!)).toEqual(corruptBytes);
+			expect(JSON.parse(fs.readFileSync(configPath, "utf8"))).toEqual({});
+			expect(fs.readFileSync(configPath, "utf8")).toBe("{}\n");
+		});
+
+		it("does not parse the existing file, so schema-invalid content is still recoverable", () => {
+			const invalid = '{"scout":{"temperature":0.2}}';
+			const invalidBytes = writeBytes(configPath, invalid);
+
+			const result = forceResetGlobalConfig(configPath);
+
+			expect(readBytes(result.backupPath!)).toEqual(invalidBytes);
+			expect(JSON.parse(fs.readFileSync(configPath, "utf8"))).toEqual({});
+			expect(loadGlobalConfig(configPath).error).toBeUndefined();
+		});
+
+		it("writes a clean config and reports no backup when the file is missing", () => {
+			expect(fs.existsSync(configPath)).toBe(false);
+
+			const result = forceResetGlobalConfig(configPath);
+
+			expect(result.backupPath).toBeUndefined();
+			expect(result.recoveredPath).toBe(configPath);
+			expect(JSON.parse(fs.readFileSync(configPath, "utf8"))).toEqual({});
+			expect(fs.readFileSync(configPath, "utf8")).toBe("{}\n");
+		});
+
+		it("leaves no temp sibling after the atomic write", () => {
+			writeBytes(configPath, "garbage");
+
+			forceResetGlobalConfig(configPath);
+
+			expect(fs.readdirSync(path.dirname(configPath))).toEqual([
+				GLOBAL_CONFIG_FILENAME,
+				expect.stringMatching(/\.corrupt-/),
+			]);
+		});
+
+		it("creates a distinct second backup when the timestamped name already exists, without clobbering the first", () => {
+			const corruptBytes = Buffer.from('"first-corrupt"');
+			writeBytes(configPath, corruptBytes);
+
+			const first = forceResetGlobalConfig(configPath);
+			expect(first.backupPath).toBeDefined();
+			const firstBackup = first.backupPath!;
+			expect(readBytes(firstBackup)).toEqual(corruptBytes);
+
+			// Pre-create a conflicting backup at the exact timestamped name the
+			// second reset will compute, so the exclusive `wx` write must collide.
+			const secondBytes = Buffer.from('"second-corrupt"');
+			writeBytes(configPath, secondBytes);
+			// Occupy the deterministic base name the next call will try first.
+			fs.writeFileSync(firstBackup, Buffer.from("occupied-placeholder"));
+
+			const second = forceResetGlobalConfig(configPath);
+			expect(second.backupPath).toBeDefined();
+			const secondBackup = second.backupPath!;
+			expect(secondBackup).not.toBe(firstBackup);
+
+			// First backup slot still holds the placeholder we wrote (not overwritten).
+			expect(readBytes(firstBackup)).toEqual(Buffer.from("occupied-placeholder"));
+			// Second reset backed up its own corrupt bytes verbatim.
+			expect(readBytes(secondBackup)).toEqual(secondBytes);
+			expect(JSON.parse(fs.readFileSync(configPath, "utf8"))).toEqual({});
+		});
+
+		it("succeeds with backupPath undefined and writes {} when the file is missing", () => {
+			expect(fs.existsSync(configPath)).toBe(false);
+
+			const result = forceResetGlobalConfig(configPath);
+
+			expect(result.backupPath).toBeUndefined();
+			expect(result.recoveredPath).toBe(configPath);
+			expect(JSON.parse(fs.readFileSync(configPath, "utf8"))).toEqual({});
+			expect(fs.readFileSync(configPath, "utf8")).toBe("{}\n");
+		});
+
+		it("backs up the original corrupt bytes verbatim before replacing the file", () => {
+			const corruptBytes = Buffer.from('\u{FEFF}not-json-at-all');
+			writeBytes(configPath, corruptBytes);
+
+			const result = forceResetGlobalConfig(configPath);
+
+			expect(result.backupPath).toBeDefined();
+			expect(readBytes(result.backupPath!)).toEqual(corruptBytes);
+			expect(JSON.parse(fs.readFileSync(configPath, "utf8"))).toEqual({});
+		});
+	});
+
+	describe("formatGlobalConfigDispatchError", () => {
+		it("embeds the underlying error and the exact recovery command", () => {
+			const message = formatGlobalConfigDispatchError(
+				"/home/user/.pi/agent/subagent-models.json: Unexpected token } in JSON",
+			);
+
+			expect(message).toContain(
+				"/home/user/.pi/agent/subagent-models.json",
+			);
+			expect(message).toContain("Unexpected token } in JSON");
+			expect(message).toContain("/agent-model global reset --force");
 		});
 	});
 

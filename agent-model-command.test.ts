@@ -12,6 +12,7 @@ import {
 } from "./agent-model-command.js";
 import type {
 	AgentModelOverride,
+	ForceResetResult,
 	SubagentModelConfig,
 } from "./model-config.js";
 import {
@@ -124,6 +125,10 @@ function makeHarness(options: HarnessOptions = {}) {
 	const resetGlobal = vi.fn((agent: string) => {
 		global = replaceOverride(global, agent, undefined);
 	});
+	const forceResetGlobal = vi.fn((): ForceResetResult => ({
+		backupPath: "/config/subagent-models.json.corrupt-2025-01-01T00-00-00-000Z",
+		recoveredPath: "/config/subagent-models.json",
+	}));
 
 	const deps: AgentModelCommandDeps = {
 		discover: vi.fn(() => agents),
@@ -135,8 +140,9 @@ function makeHarness(options: HarnessOptions = {}) {
 		})),
 		saveGlobal,
 		resetGlobal,
+		forceResetGlobal,
 		makePort: vi.fn(() => port),
-		parentFor: vi.fn(() => ({
+		parentFor: vi.fn((): AgentModelOverride => ({
 			model: "provider/parent",
 			thinkingLevel: "medium",
 		})),
@@ -184,6 +190,7 @@ function makeHarness(options: HarnessOptions = {}) {
 		models,
 		port,
 		resetGlobal,
+		forceResetGlobal,
 		saveGlobal,
 		setSessionOverride,
 		getGlobal: () => global,
@@ -272,6 +279,26 @@ describe("parseAgentModelArgs", () => {
 			scope: "global",
 			agent: "scout",
 		});
+	});
+
+	it("parses the full-global force-reset form", () => {
+		expect(parseAgentModelArgs("global reset --force")).toEqual({
+			kind: "forceReset",
+		});
+	});
+
+	it.each([
+		["session reset --force", "only valid for the global scope"],
+		["global reset", "Missing arguments for the global form"],
+		["global reset --force extra", "Use \"/agent-model global reset --force\""],
+		["global reset --recover", "Use \"/agent-model global reset --force\""],
+	])("rejects malformed force-reset form %j with usage", (input, expected) => {
+		const parsed = parseAgentModelArgs(input);
+		expect(parsed.kind).toBe("error");
+		if (parsed.kind === "error") {
+			expect(parsed.message).toContain(expected);
+			expect(parsed.message).toContain("Usage:");
+		}
 	});
 
 	it.each([
@@ -370,6 +397,51 @@ describe("registerAgentModelCommand direct forms", () => {
 		expect(harness.saveGlobal).not.toHaveBeenCalled();
 	});
 
+	it("force-resets the entire global config and reports the backup and recovered paths", async () => {
+		const harness = makeHarness();
+		const { ctx, notify } = makeContext({ mode: "tui" });
+
+		await harness.handler("global reset --force", ctx);
+
+		expect(harness.forceResetGlobal).toHaveBeenCalledOnce();
+		expect(harness.setSessionOverride).not.toHaveBeenCalled();
+		expect(harness.saveGlobal).not.toHaveBeenCalled();
+		expect(harness.resetGlobal).not.toHaveBeenCalled();
+		expect(notify).toHaveBeenCalledWith(
+			expect.stringMatching(/Global subagent model configuration reset[\s\S]*Recovered:[\s\S]*\/config\/subagent-models\.json[\s\S]*Backup of corrupt file:[\s\S]*\.corrupt-/),
+			"info",
+		);
+	});
+
+	it("force-reset works without a live UI-capable mode (recovery command)", async () => {
+		const harness = makeHarness();
+		const { ctx, notify } = makeContext({ mode: "json", hasUI: true });
+
+		await harness.handler("global reset --force", ctx);
+
+		expect(harness.forceResetGlobal).toHaveBeenCalledOnce();
+		expect(notify).toHaveBeenCalledWith(
+			expect.stringContaining("Global subagent model configuration reset"),
+			"info",
+		);
+	});
+
+	it("force-reset surfaces a no-backup message when no file existed", async () => {
+		const harness = makeHarness();
+		harness.forceResetGlobal.mockReturnValue({
+			backupPath: undefined,
+			recoveredPath: "/config/subagent-models.json",
+		});
+		const { ctx, notify } = makeContext({ mode: "tui" });
+
+		await harness.handler("global reset --force", ctx);
+
+		expect(notify).toHaveBeenCalledWith(
+			expect.stringContaining("No existing file was found"),
+			"info",
+		);
+	});
+
 	it("rejects an unknown agent before any write", async () => {
 		const harness = makeHarness();
 		const { ctx, notify } = makeContext({ mode: "tui" });
@@ -424,7 +496,7 @@ describe("registerAgentModelCommand direct forms", () => {
 		);
 	});
 
-	it("reports malformed global configuration without mutating either scope", async () => {
+	it("succeeds a session-scope change and warns when the global config is corrupt", async () => {
 		const harness = makeHarness();
 		harness.deps.loadGlobal = vi.fn(() => ({
 			config: {},
@@ -434,6 +506,40 @@ describe("registerAgentModelCommand direct forms", () => {
 		const { ctx, notify } = makeContext({ mode: "tui" });
 
 		await harness.handler("session scout provider/reasoner high", ctx);
+
+		expect(harness.setSessionOverride).toHaveBeenCalledOnce();
+		expect(harness.setSessionOverride).toHaveBeenCalledWith("scout", {
+			model: "provider/reasoner",
+			thinkingLevel: "high",
+		});
+		expect(harness.saveGlobal).not.toHaveBeenCalled();
+		expect(harness.resetGlobal).not.toHaveBeenCalled();
+		// The success notification is still emitted.
+		expect(notify).toHaveBeenCalledWith(
+			expect.stringMatching(/scout[\s\S]*provider\/reasoner[\s\S]*high[\s\S]*session/i),
+			"info",
+		);
+		// The global corruption is surfaced as a non-fatal warning that mentions recovery.
+		expect(notify).toHaveBeenCalledWith(
+			expect.stringContaining("malformed JSON"),
+			"warning",
+		);
+		expect(notify).toHaveBeenCalledWith(
+			expect.stringContaining("/agent-model global reset --force"),
+			"warning",
+		);
+	});
+
+	it("still fails closed for a global-scope change when the global config is corrupt", async () => {
+		const harness = makeHarness();
+		harness.deps.loadGlobal = vi.fn(() => ({
+			config: {},
+			error: "/config/subagent-models.json: malformed JSON",
+			path: "/config/subagent-models.json",
+		}));
+		const { ctx, notify } = makeContext({ mode: "rpc" });
+
+		await harness.handler("global scout provider/reasoner high", ctx);
 
 		expectNoWrites(harness);
 		expect(notify).toHaveBeenCalledWith(

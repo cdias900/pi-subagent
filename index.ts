@@ -42,6 +42,8 @@ import {
 	displayInputSummary,
 } from "./invocation.js";
 import {
+	formatGlobalConfigDispatchError,
+	forceResetGlobalConfig,
 	loadGlobalConfig,
 	resetGlobalOverride,
 	saveGlobalOverride,
@@ -2100,6 +2102,7 @@ export default function (pi: ExtensionAPI) {
 		loadGlobal: loadGlobalConfig,
 		saveGlobal: saveGlobalOverride,
 		resetGlobal: resetGlobalOverride,
+		forceResetGlobal: forceResetGlobalConfig,
 		makePort: makeCatalogPort,
 		parentFor: parentModelForContext,
 		buildEffectiveConfig,
@@ -2224,7 +2227,7 @@ export default function (pi: ExtensionAPI) {
 				config: globalModelConfig,
 				error: globalModelConfigError,
 			} = loadGlobalConfig();
-			if (globalModelConfigError !== undefined) throw new Error(globalModelConfigError);
+			if (globalModelConfigError !== undefined) throw new Error(formatGlobalConfigDispatchError(globalModelConfigError));
 			const catalogPort = makeCatalogPort(ctx);
 			const invocationModelOverride: AgentModelOverride = {
 				model: params.model,

@@ -339,4 +339,34 @@ describe("discovery effective model metadata", () => {
 			source: "frontmatter",
 		});
 	});
+
+	it("fail-closes subagent dispatch with a self-serving error when the global config is corrupt", async () => {
+		const configError = "/config/subagent-models.json: Unexpected token } in JSON";
+		vi.mocked(loadGlobalConfig).mockReturnValue({
+			config: {},
+			error: configError,
+			path: "/config/subagent-models.json",
+		});
+
+		const dispatch = requiredTool("subagent").execute(
+			"subagent-call",
+			{ agent: "scout", task: "do something" },
+			undefined,
+			undefined,
+			context(),
+		);
+
+		let thrown = "";
+		try {
+			await dispatch;
+		} catch (error) {
+			thrown = error instanceof Error ? error.message : String(error);
+		}
+		expect(thrown).not.toBe("");
+		expect(thrown).toContain("/config/subagent-models.json");
+		expect(thrown).toContain("--force");
+		expect(thrown).toContain("/agent-model global reset --force");
+		// The underlying parse problem must still be visible.
+		expect(thrown).toContain("Unexpected token } in JSON");
+	});
 });

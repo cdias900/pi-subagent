@@ -41,5 +41,10 @@ export default defineConfig({
   plugins: [resolveJsToTs()],
   test: {
     include: ["**/*.test.ts"],
+    // The host SDK contract test is host-specific (it asserts symbols on
+    // @earendil-works/pi-ai/compat) and runs under its own config via
+    // `npm run test:host`. Exclude it from the default suite, which resolves
+    // `@mariozechner/pi-ai` to the pinned 0.56.1 devDependency.
+    exclude: ["**/node_modules/**", "./host-sdk-contract.test.ts"],
   },
 });

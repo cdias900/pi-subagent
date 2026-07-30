@@ -1,4 +1,5 @@
-import { supportsXhigh, type Api, type Model } from "@mariozechner/pi-ai";
+import * as piAi from "@mariozechner/pi-ai";
+import type { Api, Model } from "@mariozechner/pi-ai";
 import {
 	CANONICAL_THINKING_LEVELS,
 	normalizeModelString,
@@ -47,6 +48,12 @@ export function resolveModelLayers(input: {
 
 	for (const layer of [parentLayer, ...input.layers]) {
 		if (layer === undefined) continue;
+
+		if (layer.model !== undefined && layer.model.trim() === "") {
+			throw new Error(
+				`model from source "${layer.source}" must not be empty or whitespace-only`,
+			);
+		}
 
 		const normalized = layer.model
 			? normalizeModelString(layer.model)
@@ -205,6 +212,22 @@ export function getSupportedThinkingLevelsCompat(
 		});
 	}
 
+	// Prefer the modern host API (`getSupportedThinkingLevels`) when present.
+	// pi 0.82.1's extension loader force-aliases `@mariozechner/pi-ai` to its
+	// bundled `@earendil-works/pi-ai/compat`, which removed `supportsXhigh`;
+	// a static named import becomes `undefined` at runtime and throws. The
+	// feature-detect below keeps the pinned 0.56.1 devDependency path working
+	// (it has no modern API) while never calling a missing legacy symbol.
+	const modern = (
+		piAi as unknown as {
+			getSupportedThinkingLevels?: (m: Model<Api>) => string[];
+		}
+	).getSupportedThinkingLevels;
+	if (typeof modern === "function") {
+		const levels = modern(model);
+		return CANONICAL_THINKING_LEVELS.filter((l) => levels.includes(l));
+	}
+
 	const levels: SubagentThinkingLevel[] = [
 		"off",
 		"minimal",
@@ -212,6 +235,10 @@ export function getSupportedThinkingLevelsCompat(
 		"medium",
 		"high",
 	];
-	if (supportsXhigh(model)) levels.push("xhigh");
+	// legacy fallback, guarded so a missing symbol can never throw
+	const legacy = (
+		piAi as unknown as { supportsXhigh?: (m: Model<Api>) => boolean }
+	).supportsXhigh;
+	if (typeof legacy === "function" && legacy(model)) levels.push("xhigh");
 	return levels;
 }

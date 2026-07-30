@@ -280,6 +280,36 @@ describe("resolveModelLayers", () => {
 			]).toEqual(expected);
 		},
 	);
+
+	it.each([
+		["empty string", ""],
+		["whitespace-only", "  \t "],
+	])(
+		"throws for an explicit %s model on a layer instead of silently skipping",
+		(_label, model) => {
+			expect(() =>
+				resolveModelLayers({
+					layers: [{ model, source: "frontmatter" }],
+				}),
+			).toThrow(
+				'model from source "frontmatter" must not be empty or whitespace-only',
+			);
+		},
+	);
+
+	it("does not silently inherit a lower-precedence model when a higher layer supplies an explicit empty model", () => {
+		expect(() =>
+			resolveModelLayers({
+				parent: { model: "openai/parent", thinkingLevel: "high" },
+				layers: [
+					{ model: "anthropic/frontmatter", source: "frontmatter" },
+					{ model: "", source: "global" },
+				],
+			}),
+		).toThrow(
+			'model from source "global" must not be empty or whitespace-only',
+		);
+	});
 });
 
 interface FakeCatalogOptions {

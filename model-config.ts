@@ -57,6 +57,15 @@ function validateOverride(agent: string, override: unknown): string | undefined 
 	}
 
 	if (
+		"model" in override &&
+		override.model !== undefined &&
+		typeof override.model === "string" &&
+		override.model.trim() === ""
+	) {
+		return `model for agent "${agent}" must not be empty or whitespace-only`;
+	}
+
+	if (
 		"thinkingLevel" in override &&
 		(typeof override.thinkingLevel !== "string" ||
 			!isThinkingLevel(override.thinkingLevel))
@@ -198,4 +207,84 @@ export function resetGlobalOverride(
 	const config = { ...loaded.config };
 	delete config[agent];
 	atomicWriteJson(filePath, config);
+}
+
+export interface ForceResetResult {
+	/** Path of the corrupt-file backup, or undefined when no file existed. */
+	backupPath: string | undefined;
+	/** Path of the recovered (clean) configuration file. */
+	recoveredPath: string;
+}
+
+/**
+ * Force-reset the global subagent model config without parsing the existing
+ * file. Backs up the corrupt bytes beside the original, then atomically writes
+ * a clean `{}`. Used by `/agent-model global reset --force` to recover from an
+ * unreadable config that blocks its own normal repair path.
+ */
+export function forceResetGlobalConfig(
+	filePath = getGlobalConfigPath(),
+): ForceResetResult {
+	let backupPath: string | undefined;
+
+	// Read the existing bytes directly (no TOCTOU existsSync check). Only
+	// ENOENT means "nothing to back up"; every other read error is fatal and
+	// must propagate so we never erase a file we could not back up.
+	let raw: Buffer;
+	try {
+		raw = fs.readFileSync(filePath);
+	} catch (error) {
+		if (!hasErrorCode(error, "ENOENT")) {
+			throw error;
+		}
+		raw = Buffer.alloc(0);
+	}
+
+	if (raw.length > 0) {
+		const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+		const base = `${filePath}.corrupt-${timestamp}`;
+		backupPath = writeExclusiveBackup(base, raw);
+	}
+
+	atomicWriteJson(filePath, {});
+	return { backupPath, recoveredPath: filePath };
+}
+
+/**
+ * Write `bytes` to a backup path using exclusive creation (`wx`) so two resets
+ * in the same millisecond cannot silently clobber one another. On `EEXIST`,
+ * retry with a short random suffix, bounded to a handful of attempts. If every
+ * attempt fails, throw an actionable error WITHOUT touching the original file.
+ */
+function writeExclusiveBackup(basePath: string, bytes: Buffer): string {
+	const maxAttempts = 5;
+	let candidate = basePath;
+	for (let attempt = 0; attempt < maxAttempts; attempt++) {
+		try {
+			fs.writeFileSync(candidate, bytes, { flag: "wx", mode: 0o600 });
+			return candidate;
+		} catch (error) {
+			if (!hasErrorCode(error, "EEXIST")) {
+				throw error;
+			}
+			candidate = `${basePath}-${attempt}-${Math.random().toString(36).slice(2, 8)}`;
+		}
+	}
+	throw new Error(
+		`Could not create a unique backup for ${basePath} after ${maxAttempts} attempts; the original corrupt file was left untouched. Free disk space or remove conflicting backups and retry.`,
+	);
+}
+
+/**
+ * Format the fail-closed dispatch-time error for a corrupt global config so it
+ * is self-serving: it surfaces the offending file path and parse/validation
+ * problem (already embedded in `error`) alongside the exact recovery command.
+ */
+export function formatGlobalConfigDispatchError(error: string): string {
+	return [
+		error,
+		"",
+		"The global subagent model configuration is unreadable, so no subagents can be dispatched.",
+		"Recovery: run `/agent-model global reset --force` to back up the corrupt file and restore a clean configuration.",
+	].join("\n");
 }
