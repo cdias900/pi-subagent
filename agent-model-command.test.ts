@@ -6,6 +6,9 @@ import type {
 import { describe, expect, it, vi } from "vitest";
 import type { AgentConfig } from "./agents.js";
 import {
+	buildModelItems,
+	filterModelItems,
+	formatTokenLimit,
 	parseAgentModelArgs,
 	registerAgentModelCommand,
 	type AgentModelCommandDeps,
@@ -793,5 +796,152 @@ describe("registerAgentModelCommand guided flow", () => {
 		expect(harness.resetGlobal).toHaveBeenCalledWith("scout");
 		expect(harness.setSessionOverride).not.toHaveBeenCalled();
 		expect(harness.saveGlobal).not.toHaveBeenCalled();
+	});
+});
+
+function limitModel(overrides: {
+	provider: string;
+	id: string;
+	name: string;
+	contextWindow?: number;
+	maxTokens?: number;
+}): Model<Api> {
+	return overrides as unknown as Model<Api>;
+}
+
+describe("formatTokenLimit", () => {
+	it.each([
+		[1_000_000, "1M"],
+		[1_500_000, "1.5M"],
+		[3_500_000, "3.5M"],
+		[1_234_567, "1.2M"],
+		[1_050_000, "1M"],
+		[128_000, "128K"],
+		[200_000, "200K"],
+		[8_500, "8.5K"],
+		[8192, "8K"],
+		[900, "900"],
+	])("formats %d as %s", (limit, expected) => {
+		expect(formatTokenLimit(limit)).toBe(expected);
+	});
+
+	it.each([
+		[0],
+		[-1],
+		[Number.NaN],
+		[Number.POSITIVE_INFINITY],
+		[Number.NEGATIVE_INFINITY],
+	])("returns an empty string for %d", (limit) => {
+		expect(formatTokenLimit(limit)).toBe("");
+	});
+});
+
+describe("buildModelItems", () => {
+	it("pins the agent-default entry first", () => {
+		const items = buildModelItems([fakeModel("provider", "reasoner")]);
+
+		expect(items[0]).toEqual({
+			value: "__default__",
+			label: "Use agent default",
+			description: "Clear this scope's override",
+		});
+		expect(items[1]?.value).toBe("provider/reasoner");
+	});
+
+	it("appends context and output hints to the description", () => {
+		const items = buildModelItems([
+			limitModel({
+				provider: "anthropic",
+				id: "claude-opus-4-6",
+				name: "Claude Opus 4.6",
+				contextWindow: 1_000_000,
+				maxTokens: 128_000,
+			}),
+		]);
+
+		expect(items[1]?.description).toBe("Claude Opus 4.6 · 1M ctx · 128K out");
+	});
+
+	it("omits only the unavailable segment", () => {
+		const items = buildModelItems([
+			limitModel({
+				provider: "prov",
+				id: "m",
+				name: "M",
+				contextWindow: 32_000,
+			}),
+		]);
+
+		expect(items[1]?.description).toBe("M · 32K ctx");
+	});
+});
+
+describe("filterModelItems", () => {
+	const opus = limitModel({
+		provider: "anthropic-1m",
+		id: "claude-opus-4-6",
+		name: "Claude Opus 4.6",
+		contextWindow: 1_000_000,
+		maxTokens: 128_000,
+	});
+	const zebra = limitModel({ provider: "prov", id: "m-1", name: "Zebra" });
+	const items = buildModelItems([opus, zebra]);
+
+	it("returns every item for an empty query", () => {
+		expect(filterModelItems(items, "")).toEqual(items);
+	});
+
+	it("returns every item for a whitespace-only query", () => {
+		expect(filterModelItems(items, "   ")).toEqual(items);
+	});
+
+	it("matches inside provider/id where setFilter's startsWith failed", () => {
+		const filtered = filterModelItems(items, "opus");
+
+		expect(filtered.map((item) => item.value)).toEqual([
+			"__default__",
+			"anthropic-1m/claude-opus-4-6",
+		]);
+	});
+
+	it("matches multi-token queries", () => {
+		const filtered = filterModelItems(items, "anthropic opus");
+
+		expect(filtered.map((item) => item.value)).toEqual([
+			"__default__",
+			"anthropic-1m/claude-opus-4-6",
+		]);
+	});
+
+	// The dev SDK's fuzzyFilter splits on whitespace only, so "1m/opus" stays a
+	// single token and matches as an in-order subsequence of
+	// "anthropic-1m/claude-opus-4-6"; the host SDK splits on "/" too and matches
+	// both tokens. This case passes under BOTH tokenizers.
+	it("matches slash-containing queries", () => {
+		const filtered = filterModelItems(items, "1m/opus");
+
+		expect(filtered.map((item) => item.value)).toEqual([
+			"__default__",
+			"anthropic-1m/claude-opus-4-6",
+		]);
+	});
+
+	it("searches the description text", () => {
+		const filtered = filterModelItems(items, "zebra");
+
+		expect(filtered.map((item) => item.value)).toEqual([
+			"__default__",
+			"prov/m-1",
+		]);
+	});
+
+	it("keeps only the pinned entry when nothing matches", () => {
+		expect(
+			filterModelItems(items, "qqqq").map((item) => item.value),
+		).toEqual(["__default__"]);
+	});
+
+	it("keeps the pinned entry first while filtering", () => {
+		expect(filterModelItems(items, "claude")[0]?.value).toBe("__default__");
 	});
 });

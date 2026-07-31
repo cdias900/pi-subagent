@@ -1,11 +1,16 @@
+import type { Api, Model } from "@mariozechner/pi-ai";
 import type {
 	ExtensionAPI,
 	ExtensionCommandContext,
 } from "@mariozechner/pi-coding-agent";
 import {
 	Container,
+	fuzzyFilter,
+	Input,
+	matchesKey,
 	type SelectItem,
 	SelectList,
+	type SelectListTheme,
 	Text,
 } from "@mariozechner/pi-tui";
 import type { AgentConfig } from "./agents.js";
@@ -99,6 +104,96 @@ type ExtensionMode = "tui" | "rpc" | "json" | "print";
 
 function errorWithUsage(message: string): ParsedAgentModelCommand {
 	return { kind: "error", message: `${message}\n\n${USAGE}` };
+}
+
+/**
+ * 1000000 -> "1M", 1234567 -> "1.2M", 1500000 -> "1.5M", 3500000 -> "3.5M",
+ * 1050000 -> "1M" (1.05 floored to tenths = 1.0, trailing ".0" trimmed),
+ * 128000 -> "128K", 8500 -> "8.5K", 8192 -> "8K", 900 -> "900". MILLION-scale
+ * values are floored to one decimal place then have a trailing ".0" trimmed,
+ * so capacity is never overstated. The K branch floors to an integer (an exact
+ * half X.5 keeps one decimal). Non-finite or <= 0 -> "".
+ */
+export function formatTokenLimit(limit: number): string {
+	if (!Number.isFinite(limit) || limit <= 0) {
+		return "";
+	}
+	if (limit >= 1_000_000) {
+		return formatMillion(limit / 1_000_000);
+	}
+	if (limit >= 1_000) {
+		return formatScaled(limit / 1_000, "K");
+	}
+	return String(limit);
+}
+
+/**
+ * Render a MILLION-scale value, flooring to one decimal place and trimming a
+ * trailing ".0" so integral values render without a decimal. Flooring to tenths
+ * guarantees the result never exceeds the true value.
+ */
+function formatMillion(units: number): string {
+	const floored = Math.floor(units * 10) / 10;
+	const trimmed = floored.toFixed(1).replace(/\.0$/, "");
+	return `${trimmed}M`;
+}
+
+/** Render a K-scale unit value, flooring messy fractions to avoid overstating. */
+function formatScaled(units: number, suffix: string): string {
+	if (units % 1 === 0) {
+		return `${units}${suffix}`;
+	}
+	// Exact halves (X.5) keep one decimal; anything else floors to an integer.
+	if ((units * 2) % 1 === 0) {
+		return `${units.toFixed(1)}${suffix}`;
+	}
+	return `${Math.floor(units)}${suffix}`;
+}
+
+/** Build the picker item list, including the pinned "agent default" entry. */
+export function buildModelItems(models: readonly Model<Api>[]): SelectItem[] {
+	return [
+		{
+			value: DEFAULT_MODEL_VALUE,
+			label: DEFAULT_REASONING_LABEL,
+			description: "Clear this scope's override",
+		},
+		...models.map((model) => {
+			const parts = [model.name];
+			const context = formatTokenLimit(model.contextWindow);
+			if (context) {
+				parts.push(`${context} ctx`);
+			}
+			const output = formatTokenLimit(model.maxTokens);
+			if (output) {
+				parts.push(`${output} out`);
+			}
+			return {
+				value: `${model.provider}/${model.id}`,
+				label: `${model.provider}/${model.id}`,
+				description: parts.filter(Boolean).join(" · "),
+			};
+		}),
+	];
+}
+
+/**
+ * Fuzzy-filter picker items. The pinned default entry is always kept first so
+ * an override can be cleared regardless of the query. Blank query returns all.
+ */
+export function filterModelItems(
+	items: readonly SelectItem[],
+	query: string,
+): SelectItem[] {
+	const pinned = items.filter((item) => item.value === DEFAULT_MODEL_VALUE);
+	const rest = items.filter((item) => item.value !== DEFAULT_MODEL_VALUE);
+	if (query.trim() === "") {
+		return [...pinned, ...rest];
+	}
+	return [
+		...pinned,
+		...fuzzyFilter(rest, query, (item) => `${item.value} ${item.description ?? ""}`),
+	];
 }
 
 export function parseAgentModelArgs(argStr: string): ParsedAgentModelCommand {
@@ -355,48 +450,102 @@ function formatEffectiveConfigRow(
 	return `${agent.name} — ${effective.model ?? "agent default"}${level} (${effective.source})`;
 }
 
+/**
+ * Keys that Input consumes by moving the cursor without changing the text.
+ * These must NOT be forwarded to SelectList after Input ignores them, or they
+ * would double-navigate. The `cursor` field is private in both pi-tui SDKs
+ * (0.56.1 and 0.83.0), so cursor movement cannot be detected via state
+ * comparison alone — only value changes can. KeyId literals below are verified
+ * present in both SDKs' keys.d.ts, and the bindings resolve to these actions in
+ * both Input implementations:
+ *   left / ctrl+b      -> cursorLeft
+ *   right / ctrl+f     -> cursorRight
+ *   home / ctrl+a      -> cursorLineStart
+ *   end / ctrl+e       -> cursorLineEnd
+ *   alt+left / ctrl+left / alt+b -> cursorWordLeft
+ *   alt+right / ctrl+right / alt+f -> cursorWordRight
+ */
+function isCursorOnlyKey(data: string): boolean {
+	return (
+		matchesKey(data, "left") ||
+		matchesKey(data, "right") ||
+		matchesKey(data, "home") ||
+		matchesKey(data, "end") ||
+		matchesKey(data, "ctrl+a") ||
+		matchesKey(data, "ctrl+b") ||
+		matchesKey(data, "ctrl+e") ||
+		matchesKey(data, "ctrl+f") ||
+		matchesKey(data, "alt+left") ||
+		matchesKey(data, "ctrl+left") ||
+		matchesKey(data, "alt+b") ||
+		matchesKey(data, "alt+right") ||
+		matchesKey(data, "ctrl+right") ||
+		matchesKey(data, "alt+f")
+	);
+}
+
 async function selectModel(
 	ctx: ExtensionCommandContext,
 ): Promise<string | undefined> {
 	const models = [...ctx.modelRegistry.getAvailable()].sort((left, right) =>
 		`${left.provider}/${left.id}`.localeCompare(`${right.provider}/${right.id}`),
 	);
-	const items: SelectItem[] = [
-		{
-			value: DEFAULT_MODEL_VALUE,
-			label: DEFAULT_REASONING_LABEL,
-			description: "Clear this scope's override",
-		},
-		...models.map((model) => ({
-			value: `${model.provider}/${model.id}`,
-			label: `${model.provider}/${model.id}`,
-			description: model.name,
-		})),
-	];
+	const items = buildModelItems(models);
 
 	return ctx.ui.custom<string | undefined>((tui, theme, _kb, done) => {
+		// items always contains the pinned default entry, so this is >= 1.
+		const maxVisible = Math.max(1, Math.min(items.length, 12));
 		const container = new Container();
-		container.addChild(
-			new Text(theme.fg("accent", theme.bold("Choose a model")), 0, 0),
+		const header = new Text("", 0, 0);
+		const search = new Input();
+		search.focused = true;
+		const hint = new Text(
+			theme.fg("dim", "type to search • ↑↓ navigate • enter select • esc cancel"),
+			0,
+			0,
 		);
+		// SelectList has no setItems and Container has no insert-at-index, so a
+		// query change rebuilds the list and re-adds all children in order. The
+		// theme is a single shared const so the five callbacks are not duplicated.
+		const listTheme: SelectListTheme = {
+			selectedPrefix: (text: string) => theme.fg("accent", text),
+			selectedText: (text: string) => theme.fg("accent", text),
+			description: (text: string) => theme.fg("muted", text),
+			scrollInfo: (text: string) => theme.fg("dim", text),
+			noMatch: (text: string) => theme.fg("warning", text),
+		};
+		let lastQuery = "";
 
-		const selectList = new SelectList(items, Math.min(items.length, 12), {
-			selectedPrefix: (text) => theme.fg("accent", text),
-			selectedText: (text) => theme.fg("accent", text),
-			description: (text) => theme.fg("muted", text),
-			scrollInfo: (text) => theme.fg("dim", text),
-			noMatch: (text) => theme.fg("warning", text),
-		});
-		selectList.onSelect = (item) => done(item.value);
-		selectList.onCancel = () => done(undefined);
-		container.addChild(selectList);
-		container.addChild(
-			new Text(
-				theme.fg("dim", "↑↓ navigate • enter select • esc cancel"),
-				0,
-				0,
-			),
-		);
+		// SelectList has no setItems and Container has no insert-at-index, so a
+		// query change rebuilds the list and re-adds all children in order.
+		const mount = (filtered: SelectItem[]): SelectList => {
+			const next = new SelectList(filtered, maxVisible, listTheme);
+			next.onSelect = (item) => done(item.value);
+			next.onCancel = () => done(undefined);
+			header.setText(
+				theme.fg(
+					"accent",
+					theme.bold(`Choose a model (${filtered.length}/${items.length})`),
+				),
+			);
+			container.clear();
+			container.addChild(header);
+			container.addChild(search);
+			container.addChild(next);
+			container.addChild(hint);
+			// filterModelItems always pins the "Use agent default" entry at index
+			// 0, and each rebuilt SelectList resets its selection to 0. When a
+			// query is active, jump to the first real match so Enter picks the
+			// best result rather than the pinned default.
+			const topMatch = filtered.findIndex(
+				(item) => item.value !== DEFAULT_MODEL_VALUE,
+			);
+			if (lastQuery.trim() !== "" && topMatch > 0) {
+				next.setSelectedIndex(topMatch);
+			}
+			return next;
+		};
+		let selectList = mount(items);
 
 		return {
 			render(width: number) {
@@ -406,7 +555,53 @@ async function selectModel(
 				container.invalidate();
 			},
 			handleInput(data: string) {
-				selectList.handleInput(data);
+				// matchesKey + literal KeyIds exist with identical semantics in both
+				// the dev SDK (0.56.1) and host SDK (0.83.0); getKeybindings does not
+				// exist in the dev SDK — do not use it here. The `_kb` param is
+				// intentionally unused: the two SDKs expose incompatible
+				// keybinding registries, so we route explicitly and fall back to
+				// SelectList's own SDK-native registry for user-remapped actions.
+				//
+				// Search owns ALL text entry. Pi enables the Kitty keyboard
+				// protocol, so on a Kitty-capable terminal a plain "a" arrives as a
+				// CSI-u escape sequence containing ESC; Input decodes it internally.
+				// Bracketed paste is likewise decoded by Input. Classifying keys as
+				// "printable" ourselves would break both, so instead we let Input
+				// try first and forward only what it did not consume.
+				//
+				// Consequence: a select action remapped to a PRINTABLE key (e.g.
+				// select-down -> "j") will type into the search box instead of
+				// navigating, because search owns printable input.
+				if (matchesKey(data, "escape") || matchesKey(data, "ctrl+c")) {
+					done(undefined);
+				} else if (
+					matchesKey(data, "up") ||
+					matchesKey(data, "down") ||
+					matchesKey(data, "pageUp") ||
+					matchesKey(data, "pageDown") ||
+					matchesKey(data, "enter")
+				) {
+					selectList.handleInput(data);
+				} else {
+					// Input owns all text entry, including Kitty CSI-u printables and
+					// bracketed paste, which it decodes internally. Only keys it did
+					// not consume are offered to the list, so user-remapped select
+					// actions still navigate. The `cursor` field is private in both
+					// SDKs, so cursor-only moves (left/right/home/end/ctrl+a…) are
+					// detected via an explicit guard rather than state comparison.
+					const before = search.getValue();
+					search.handleInput(data);
+					const after = search.getValue();
+					if (after !== before) {
+						lastQuery = after;
+						selectList = mount(filterModelItems(items, after));
+					} else if (!isCursorOnlyKey(data)) {
+						// Input ignored it entirely — might be a remapped select
+						// action. SelectList resolves it via its own SDK-native
+						// keybindings registry; safe no-op otherwise.
+						selectList.handleInput(data);
+					}
+				}
 				tui.requestRender();
 			},
 		};

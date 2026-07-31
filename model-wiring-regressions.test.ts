@@ -374,14 +374,30 @@ describe("agent model command wiring", () => {
 
 	it("builds the model picker with a Container and an explicit five-callback SelectListTheme", () => {
 		expect(AGENT_MODEL_COMMAND_SRC).toContain("new Container()");
+		// The theme is extracted to a single typed const rather than inlined
+		// twice. This still fails if someone drops any of the five callbacks or
+		// stops passing the theme to SelectList: the const must define all five,
+		// and every `new SelectList(...)` must pass `listTheme` (not an inline
+		// object literal).
 		expect(AGENT_MODEL_COMMAND_SRC).toMatch(
-			/new SelectList\([\s\S]*?\{[\s\S]*?selectedPrefix:\s*\([^)]*\)\s*=>\s*theme\.fg\(["']accent["'][\s\S]*?selectedText:\s*\([^)]*\)\s*=>\s*theme\.fg\(["']accent["'][\s\S]*?description:\s*\([^)]*\)\s*=>\s*theme\.fg\(["']muted["'][\s\S]*?scrollInfo:\s*\([^)]*\)\s*=>\s*theme\.fg\(["']dim["'][\s\S]*?noMatch:\s*\([^)]*\)\s*=>\s*theme\.fg\(["']warning["']/,
+			/const\s+listTheme:\s*SelectListTheme\s*=\s*\{[\s\S]*?selectedPrefix:\s*\([^)]*\)\s*=>\s*theme\.fg\(["']accent["'][\s\S]*?selectedText:\s*\([^)]*\)\s*=>\s*theme\.fg\(["']accent["'][\s\S]*?description:\s*\([^)]*\)\s*=>\s*theme\.fg\(["']muted["'][\s\S]*?scrollInfo:\s*\([^)]*\)\s*=>\s*theme\.fg\(["']dim["'][\s\S]*?noMatch:\s*\([^)]*\)\s*=>\s*theme\.fg\(["']warning["'][\s\S]*?\};/,
+		);
+		// Every SelectList construction must pass the shared theme const — no
+		// inline object literal may sneak back in.
+		const selectListCalls = extractCalls(
+			AGENT_MODEL_COMMAND_SRC,
+			"new SelectList",
+		);
+		expect(selectListCalls.length).toBeGreaterThanOrEqual(1);
+		for (const call of selectListCalls) {
+			expect(call).toContain(", listTheme)");
+			expect(call).not.toMatch(/,\s*\{[\s\S]*selectedPrefix:/);
+		}
+		expect(AGENT_MODEL_COMMAND_SRC).toMatch(
+			/\.onSelect\s*=\s*\([^)]*\)\s*=>\s*done\(/,
 		);
 		expect(AGENT_MODEL_COMMAND_SRC).toMatch(
-			/selectList\.onSelect\s*=\s*\([^)]*\)\s*=>\s*done\(/,
-		);
-		expect(AGENT_MODEL_COMMAND_SRC).toMatch(
-			/selectList\.onCancel\s*=\s*\(\)\s*=>\s*done\(undefined\)/,
+			/\.onCancel\s*=\s*\(\)\s*=>\s*done\(undefined\)/,
 		);
 	});
 
