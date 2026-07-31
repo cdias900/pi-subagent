@@ -18,7 +18,14 @@ jobs:
           node-version: '22.19.0'
           cache: 'npm'
 
-      - run: npm ci
+      # `npm ci` is not used here: the committed lockfile is generated on macOS,
+      # and npm's strict lockfile check fails on Linux runners over nested
+      # platform-specific optional dependencies (rolldown's wasm binding pulls a
+      # different @emnapi/core version than the lock records). Regenerating the
+      # lock resolves prerelease versions that break the build, so we install
+      # without the strict lockfile equality check.
+      - name: Install dependencies
+        run: npm install --no-audit --no-fund
 
       - name: Typecheck
         run: npm run typecheck
