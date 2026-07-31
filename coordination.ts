@@ -127,6 +127,7 @@ export function registerCoordinationTools(pi: ExtensionAPI): void {
 							`Use subagent(team: "${name}", agent: "scout|planner|executor|reviewer", task: "...", saveAs: "...") to spawn agents.`,
 					},
 				],
+				details: {},
 			};
 		},
 	});
@@ -145,10 +146,11 @@ export function registerCoordinationTools(pi: ExtensionAPI): void {
 			const dir = teamDir(params.team_name);
 			try {
 				fs.rmSync(dir, { recursive: true, force: true });
-				return { content: [{ type: "text", text: `Team "${params.team_name}" deleted.` }] };
+				return { content: [{ type: "text", text: `Team "${params.team_name}" deleted.` }], details: {} };
 			} catch (err: any) {
 				return {
 					content: [{ type: "text", text: `Failed to delete team: ${err.message}` }],
+					details: {},
 					isError: true,
 				};
 			}
@@ -179,6 +181,7 @@ export function registerCoordinationTools(pi: ExtensionAPI): void {
 			if (tasks.find((t) => t.id === params.taskId)) {
 				return {
 					content: [{ type: "text", text: `Task "${params.taskId}" already exists.` }],
+					details: {},
 					isError: true,
 				};
 			}
@@ -204,6 +207,7 @@ export function registerCoordinationTools(pi: ExtensionAPI): void {
 						text: `Task "${params.taskId}" created (${params.assignee || "unassigned"}, pending).`,
 					},
 				],
+				details: {},
 			};
 		},
 	});
@@ -232,6 +236,7 @@ export function registerCoordinationTools(pi: ExtensionAPI): void {
 			if (!task) {
 				return {
 					content: [{ type: "text", text: `Task "${params.taskId}" not found.` }],
+					details: {},
 					isError: true,
 				};
 			}
@@ -249,6 +254,7 @@ export function registerCoordinationTools(pi: ExtensionAPI): void {
 						text: `Task "${params.taskId}" updated → ${task.status} (${task.assignee || "unassigned"}).`,
 					},
 				],
+				details: {},
 			};
 		},
 	});
@@ -267,7 +273,7 @@ export function registerCoordinationTools(pi: ExtensionAPI): void {
 			const tasks = readTasks(params.team_name);
 
 			if (tasks.length === 0) {
-				return { content: [{ type: "text", text: "No tasks." }] };
+				return { content: [{ type: "text", text: "No tasks." }], details: {} };
 			}
 
 			const statusIcon: Record<string, string> = {
@@ -301,6 +307,7 @@ export function registerCoordinationTools(pi: ExtensionAPI): void {
 							lines.join("\n"),
 					},
 				],
+				details: {},
 			};
 		},
 	});
@@ -330,6 +337,7 @@ export function registerCoordinationTools(pi: ExtensionAPI): void {
 			if (!fs.existsSync(dir)) {
 				return {
 					content: [{ type: "text", text: `Team "${params.team_name}" not found.` }],
+					details: {},
 					isError: true,
 				};
 			}
@@ -345,6 +353,7 @@ export function registerCoordinationTools(pi: ExtensionAPI): void {
 				});
 				return {
 					content: [{ type: "text", text: `Shutdown ${msgType === "shutdown_request" ? "requested" : "acknowledged"}.` }],
+					details: {},
 				};
 			}
 
@@ -361,6 +370,7 @@ export function registerCoordinationTools(pi: ExtensionAPI): void {
 						text: `Message logged → ${params.recipient || "all"}: ${params.content.slice(0, 100)}${params.content.length > 100 ? "..." : ""}`,
 					},
 				],
+				details: {},
 			};
 		},
 	});

@@ -4,12 +4,13 @@
  * Scope: verify that transport selection (foreground JSON mode vs background RPC
  * mode) and isolation flag emission are preserved across all configurations
  * reachable through the exported pure seams in index.ts:
+ *   - buildModelArgs
  *   - buildForegroundToolArgs
  *   - buildBackgroundToolArgs
  *   - buildSystemPromptArgs
+ *   - buildIsolationArgs
  *
- * These three helpers are the ONLY exported functions in index.ts. The actual
- * telemetry extraction (foreground usage/cost/token parsing of `message_end`
+ * Actual telemetry extraction (foreground usage/cost/token parsing of `message_end`
  * events) and background persistence (usage accumulation, appendEntry, saveOutput)
  * live in non-exported closures inside runSingleAgent / launchBackgroundAgent /
  * handleBgSignal / appendBgUsageEntry. Those closures can only be exercised by
@@ -27,6 +28,7 @@ import { describe, it, expect } from "vitest";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
+	buildModelArgs,
 	buildForegroundToolArgs,
 	buildBackgroundToolArgs,
 	buildSystemPromptArgs,
@@ -60,7 +62,8 @@ const BUNDLED_NAMES = ["scout", "planner", "reviewer", "executor"];
 
 function foregroundArgs(agent: AgentConfig): string[] {
 	const args: string[] = ["--mode", "json", "-p", "--no-session", "--no-extensions"];
-	if (agent.model) args.push("--model", agent.model);
+	// These fixtures intentionally model frontmatter only, not parent/session context.
+	args.push(...buildModelArgs({ model: agent.model }));
 	args.push(...buildForegroundToolArgs(agent.tools));
 	// Mirror index.ts::runSingleAgent exactly: a prompt file is written when there
 	// is a prompt body OR replace mode is set (replace still overrides Pi's default
@@ -93,7 +96,8 @@ function foregroundArgs(agent: AgentConfig): string[] {
 function backgroundArgs(agent: AgentConfig): string[] {
 	const args: string[] = ["--mode", "rpc", "--no-session", "--no-extensions"];
 	args.push("-e", "<bg-signal-ext>");
-	if (agent.model) args.push("--model", agent.model);
+	// These fixtures intentionally model frontmatter only, not parent/session context.
+	args.push(...buildModelArgs({ model: agent.model }));
 	args.push(...buildBackgroundToolArgs(agent.tools));
 	// launchBackgroundAgent always builds a non-empty fullSystemPrompt because it
 	// appends the always-present BG_SIGNAL_INSTRUCTION to the agent body, so the

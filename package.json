@@ -15,7 +15,9 @@
   },
   "license": "MIT",
   "scripts": {
-    "test": "vitest run"
+    "test": "vitest run",
+    "test:host": "vitest run --config vitest.host.config.ts",
+    "typecheck": "tsc --noEmit"
   },
   "peerDependencies": {
     "@mariozechner/pi-agent-core": "*",
@@ -34,6 +36,8 @@
     "ajv-formats": "^3.0.1"
   },
   "devDependencies": {
+    "@earendil-works/pi-ai": "0.82.1",
+    "typescript": "^5.9.3",
     "vitest": "^4.1.10"
   }
 }

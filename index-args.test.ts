@@ -2,6 +2,7 @@
  * Tests for the foreground/background spawn-isolation arg helpers.
  *
  * These tests exercise the pure, exported helpers from index.ts:
+ *   - buildModelArgs
  *   - buildForegroundToolArgs
  *   - buildBackgroundToolArgs
  *   - buildSystemPromptArgs
@@ -18,6 +19,7 @@ import { describe, it, expect } from "vitest";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
+	buildModelArgs,
 	buildForegroundToolArgs,
 	buildBackgroundToolArgs,
 	buildSystemPromptArgs,
@@ -315,8 +317,9 @@ describe("buildIsolationArgs", () => {
  */
 function foregroundArgs(agent: AgentConfig): string[] {
 	const args: string[] = ["--mode", "json", "-p", "--no-session", "--no-extensions"];
-	// No extensions/mcps for bundled agents in these snapshots.
-	if (agent.model) args.push("--model", agent.model);
+	// These fixtures supply only the frontmatter model; they do not reconstruct
+	// parent or session model context. Bundled snapshot agents are model-less.
+	args.push(...buildModelArgs({ model: agent.model }));
 	args.push(...buildForegroundToolArgs(agent.tools));
 	const hasPromptBody = agent.systemPrompt.trim().length > 0;
 	const isReplace = agent.systemPromptMode === "replace";
@@ -355,9 +358,10 @@ function foregroundArgs(agent: AgentConfig): string[] {
  */
 function backgroundArgs(agent: AgentConfig): string[] {
 	const args: string[] = ["--mode", "rpc", "--no-session", "--no-extensions"];
-	// No extensions/mcps for bundled agents in these snapshots.
+	// These fixtures supply only the frontmatter model; they do not reconstruct
+	// parent or session model context. Bundled snapshot agents are model-less.
 	args.push("-e", "<bg-signal-ext>");
-	if (agent.model) args.push("--model", agent.model);
+	args.push(...buildModelArgs({ model: agent.model }));
 	args.push(...buildBackgroundToolArgs(agent.tools));
 	// launchBackgroundAgent always builds a non-empty fullSystemPrompt because it
 	// appends the always-present BG_SIGNAL_INSTRUCTION to the agent body, so the
@@ -759,5 +763,41 @@ describe("no unrelated arg drift", () => {
 			const extIdx = bg.indexOf("<bg-signal-ext>");
 			expect(toolsIdx).toBeGreaterThan(extIdx);
 		}
+	});
+
+	it("foreground model/thinking flags stay after extension setup and before tools and prompt", () => {
+		const args = foregroundArgs({
+			...BUNDLED.scout,
+			model: "provider/base:high",
+		});
+		const extensionIdx = args.indexOf("--no-extensions");
+		const modelIdx = args.indexOf("--model");
+		const thinkingIdx = args.indexOf("--thinking");
+		const toolsIdx = args.indexOf("--tools");
+		const systemPromptIdx = args.indexOf("--append-system-prompt");
+		const taskPromptIdx = args.indexOf(TASK_PROMPT);
+
+		expect(extensionIdx).toBeLessThan(modelIdx);
+		expect(modelIdx).toBeLessThan(thinkingIdx);
+		expect(thinkingIdx).toBeLessThan(toolsIdx);
+		expect(toolsIdx).toBeLessThan(systemPromptIdx);
+		expect(systemPromptIdx).toBeLessThan(taskPromptIdx);
+	});
+
+	it("background model/thinking flags stay after extensions and before tools and prompt", () => {
+		const args = backgroundArgs({
+			...BUNDLED.scout,
+			model: "provider/base:high",
+		});
+		const extensionIdx = args.indexOf("<bg-signal-ext>");
+		const modelIdx = args.indexOf("--model");
+		const thinkingIdx = args.indexOf("--thinking");
+		const toolsIdx = args.indexOf("--tools");
+		const promptIdx = args.indexOf("--append-system-prompt");
+
+		expect(extensionIdx).toBeLessThan(modelIdx);
+		expect(modelIdx).toBeLessThan(thinkingIdx);
+		expect(thinkingIdx).toBeLessThan(toolsIdx);
+		expect(toolsIdx).toBeLessThan(promptIdx);
 	});
 });

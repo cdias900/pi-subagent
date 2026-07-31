@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          # Node floor comes from the real host SDK's engines requirement
+          node-version: '22.19.0'
+          cache: 'npm'
+
+      - run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Unit tests
+        run: npm test
+
+      # The host-SDK contract test is deliberately NOT part of the default
+      # `npm test` suite: it is excluded in vitest.config.ts and runs under
+      # vitest.host.config.ts, which aliases `@mariozechner/pi-ai` to the
+      # real host package `@earendil-works/pi-ai` (its `compat` entry). It is
+      # the only check that catches a symbol being removed from the real host
+      # SDK — the exact class of bug that broke this PR.
+      - name: Host SDK contract test
+        run: npm run test:host

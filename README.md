@@ -263,12 +263,162 @@ tools: read, grep, find, ls, bash
 Your custom system prompt here...
 ```
 
-The `model` field is optional. When omitted, the agent uses PI's current session model.
+The `model` field is optional. When omitted, the agent inherits the parent PI model and reasoning level unless a global, session, invocation, or task override applies. Use `/agent-model` for session or global defaults, or pass `model` and `thinkingLevel` to `subagent` for one run.
+
+## Model & Reasoning Selection
+
+Use `/agent-model` in the interactive TUI for a guided picker. It shows each agent's effective model, reasoning level, and source, then lets you:
+
+1. Choose an agent, or start with `/agent-model <agent>`.
+2. Choose an available model, or clear the selected scope's override.
+3. Choose a reasoning level supported by that model, or use the model default.
+4. Save the choice for the current PI session or as a global default.
+
+The guided flow is TUI-only. Direct set and reset forms work with a live TUI or RPC UI:
+
+```text
+/agent-model session <agent> <provider/model> [level]
+/agent-model global <agent> <provider/model> [level]
+/agent-model session <agent> reset
+/agent-model global <agent> reset
+```
+
+In headless, JSON, or print modes, pass `model` and `thinkingLevel` to the `subagent` tool instead of using the command.
+
+### Global Defaults
+
+Global overrides are stored by agent name in `~/.pi/agent/subagent-models.json`:
+
+```json
+{
+  "scout": {
+    "model": "anthropic/claude-sonnet-4-6",
+    "thinkingLevel": "high"
+  },
+  "reviewer": {
+    "thinkingLevel": "off"
+  }
+}
+```
+
+`model` and `thinkingLevel` are independently optional. Global updates replace the file atomically with user-only permissions. If the file contains malformed JSON or invalid entries, pi-subagent reports the error and leaves the file unchanged rather than overwriting it. A malformed `~/.pi/agent/subagent-models.json` blocks all subagent dispatches until repaired. Agent discovery remains available through `list_subagents` and `describe_agent`, with configuration diagnostics included in their results.
+
+### Session Lifecycle
+
+Session overrides are saved in PI's session history. The latest values survive `/reload`, are restored when the session is resumed, and are inherited by forks. A new session starts without session overrides. Resetting an agent removes only the selected session or global scope.
+
+### Resolution Rules
+
+Model and reasoning fields resolve independently from highest to lowest priority:
+
+```text
+task > invocation > session > global > frontmatter > parent
+```
+
+- A higher-priority model-only override clears lower-priority reasoning, so the selected model uses its own default.
+- A model may include a canonical suffix such as `provider/model:high`; a separate `thinkingLevel` at the same or higher priority wins over the suffix.
+- Normalization emits a suffix-free model ID and passes the resolved reasoning level separately with the `--thinking` flag.
+- Canonical levels are `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, and `max`.
+- Supported levels depend on the model. Non-reasoning models accept only `off`, and extended levels such as `xhigh` or `max` are available only when the model supports them.
+
+#### Suffix collision with `:off` and `:max`
+
+The set of trailing suffixes stripped and interpreted as reasoning levels was
+extended by this PR. The five previously recognized tokens were `minimal`,
+`low`, `medium`, `high`, and `xhigh`. The canonical set is now seven — `off`
+and `max` were added — so `:off` and `:max` are now also stripped from a model
+id and treated as reasoning levels.
+
+This introduces a **suffix collision** that is syntactically undetectable: the
+parser cannot distinguish a model tag from a reasoning level. A model id that
+legitimately ends in `:off` or `:max` is now silently rewritten.
+
+For example, an Ollama-style tag id such as `ollama/qwen:max`:
+
+- **Before this PR** — passed through verbatim as a single `--model` value:
+  `--model ollama/qwen:max`
+- **After this PR** — split into a base id and a reasoning level:
+  `--model ollama/qwen --thinking max`
+
+**Practical impact:** if you use a model whose id genuinely ends in `:off` or
+`:max`, pi-subagent will now dispatch a different model than the one you named
+and pass an unintended `--thinking` level, with no warning. The collision
+cannot be detected at parse time because the suffix is identical to a valid
+reasoning token.
+
+If a model ID genuinely ends in `:off` or `:max`, it cannot currently be
+represented through pi-subagent's `model` field, because every model value
+passes through the same suffix parser. Use a different model tag or alias that
+does not end in a canonical reasoning token. For non-colliding model IDs,
+prefer the separate `thinkingLevel` field instead of encoding reasoning in the
+model ID.
+
+### Per-Run Overrides
+
+Top-level fields apply to the whole invocation. Fields on a parallel task or chain step override them for that item. Replace the example IDs with exact models available in PI.
+
+**Single:**
+
+```typescript
+subagent({
+  agent: "scout",
+  task: "Map the authentication flow",
+  model: "provider/model",
+  thinkingLevel: "high"
+})
+```
+
+**Parallel:**
+
+```typescript
+subagent({
+  model: "provider/default-model",
+  thinkingLevel: "low",
+  tasks: [
+    { agent: "scout", task: "Map the API" },
+    {
+      agent: "reviewer",
+      task: "Review authentication",
+      model: "provider/review-model",
+      thinkingLevel: "high"
+    }
+  ]
+})
+```
+
+**Chain:**
+
+```typescript
+subagent({
+  model: "provider/default-model",
+  thinkingLevel: "medium",
+  chain: [
+    { agent: "planner", task: "Plan the migration" },
+    {
+      agent: "executor",
+      task: "Implement this plan: {previous}",
+      model: "provider/coding-model",
+      thinkingLevel: "max"
+    }
+  ]
+})
+```
+
+Explicit selections are checked against the available, authenticated models and each model's supported reasoning levels. For parallel runs and chains, every task or step is resolved and validated before any subagent is spawned, including background runs. One invalid selection fails the whole run before spawning; reasoning levels are never silently clamped or downgraded.
+
+> [!NOTE]
+> The `/agent-model` picker deliberately manages user and bundled agents only. It does not list project-local agents or configure project-specific model policy.
 
 ## Commands
 
 | Command | Description |
 |---------|-------------|
+| `/agent-model` | Open the guided model and reasoning picker (TUI only) |
+| `/agent-model <agent>` | Open the guided picker for one agent (TUI only) |
+| `/agent-model session <agent> <provider/model> [level]` | Set a current-session override (TUI or RPC UI) |
+| `/agent-model global <agent> <provider/model> [level]` | Set a global default (TUI or RPC UI) |
+| `/agent-model session <agent> reset` | Clear a current-session override (TUI or RPC UI) |
+| `/agent-model global <agent> reset` | Clear a global default (TUI or RPC UI) |
 | `/team` | List all teams |
 | `/team new <name>` | Create a team |
 | `/team info <name>` | Show team details and outputs |
@@ -281,14 +431,18 @@ The `model` field is optional. When omitted, the agent uses PI's current session
 |-----------|-------|-------------|
 | `agent` + `task` | single | One agent, freeform task |
 | `agent` + `input` | single | One agent, structured JSON input |
-| `tasks` | parallel | Array of `{agent, task?, input?, cwd?, saveAs?, mcps?}` |
+| `tasks` | parallel | Array of `{agent, task?, input?, model?, thinkingLevel?, cwd?, saveAs?, mcps?}` |
 | `chain` | chain | Sequential with `{previous}` placeholder (works in `task` or string leaves of `input`) |
+| `model` | all / per task | Exact model override; top-level applies invocation-wide, while a task or chain step wins for that item |
+| `thinkingLevel` | all / per task | Canonical reasoning override; top-level applies invocation-wide, while a task or chain step wins for that item |
 | `team` | all | Team name → `~/.pi/teams/{name}/` |
 | `saveAs` | all | Output name (default: agent name) |
 | `mcps` | per task | MCP server names to scope |
 | `cwd` | all | Working directory |
 | `agentScope` | all | `"user"` / `"project"` / `"both"` |
 | `confirmProjectAgents` | all | `true`/`false`. **Note:** Headless/API/RPC contexts require explicit `false` to run project agents. |
+
+`list_subagents()` and `describe_agent()` include each agent's effective `model`, `thinkingLevel`, and winning configuration `source` so callers can inspect the selection before invoking it.
 
 ### Security Model: Project-Local Agents
 
@@ -302,13 +456,21 @@ Because Pi's RPC UI protocol can be auto-answered by programmatic clients, `ctx.
 
 ```
 pi-subagent/
-├── package.json        # PI package manifest
+├── package.json             # PI package manifest
 ├── README.md
-├── index.ts            # Entry point: subagent tool + team commands
-├── agents.ts           # Agent discovery (bundled + user + project)
-├── team.ts             # Team dir, shared context, named outputs, placeholders
-├── coordination.ts     # TeamCreate, TaskCreate, SendMessage tools
-└── agents/             # Default agent definitions
+├── index.ts                 # Extension entry point, tools, commands, and process orchestration
+├── agents.ts                # Agent discovery (bundled + user + project)
+├── invocation.ts            # Invocation validation, prompt construction, and model layering
+├── parameters.ts            # Parameter schema validation and discovery metadata
+├── model-normalize.ts       # Model ID normalization and canonical reasoning levels
+├── model-config.ts          # Global overrides and atomic persistence
+├── model-session.ts         # Session override snapshots and restoration
+├── model-resolution.ts      # Precedence, model lookup, and capability validation
+├── agent-model-command.ts   # Guided and direct `/agent-model` flows
+├── team.ts                  # Team directories, shared context, outputs, and placeholders
+├── coordination.ts          # TeamCreate, TaskCreate, and SendMessage tools
+├── bg-signal.ts             # Background child lifecycle signaling tool
+└── agents/                  # Default agent definitions
     ├── scout.md
     ├── planner.md
     ├── executor.md
