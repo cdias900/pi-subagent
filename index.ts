@@ -461,6 +461,9 @@ interface ForegroundAgentHandle {
 	proc: ChildProcess | null;
 	controller: AbortController;
 	startTime: number;
+	lastEventAt: number;
+	currentTool?: string;
+	turns: number;
 }
 const foregroundAgents = new Map<string, ForegroundAgentHandle>();
 let foregroundAgentSeq = 0;
@@ -1012,7 +1015,7 @@ async function runSingleAgent(
 				stdio: ["ignore", "pipe", "pipe"],
 				...(spawnEnv ? { env: spawnEnv } : {}),
 			});
-			foregroundAgents.set(runId, { id: runId, agentName, task, proc, controller: runController, startTime: Date.now() });
+			foregroundAgents.set(runId, { id: runId, agentName, task, proc, controller: runController, startTime: Date.now(), lastEventAt: Date.now(), turns: 0 });
 			let buffer = "";
 
 			const processLine = (line: string) => {
@@ -1024,12 +1027,21 @@ async function runSingleAgent(
 					return;
 				}
 
+				const h = foregroundAgents.get(runId);
+				if (h) h.lastEventAt = Date.now();
+
+				if (event.type === "tool_call") {
+					const toolName = event.name ?? event.toolCall?.name;
+					if (h && typeof toolName === "string") h.currentTool = toolName;
+				}
+
 				if (event.type === "message_end" && event.message) {
 					const msg = event.message as Message;
 					currentResult.messages.push(msg);
 
 					if (msg.role === "assistant") {
 						currentResult.usage.turns++;
+						if (h) h.turns = currentResult.usage.turns;
 						const usage = msg.usage;
 						if (usage) {
 							currentResult.usage.input += usage.input || 0;
@@ -1049,6 +1061,7 @@ async function runSingleAgent(
 
 				if (event.type === "tool_result_end" && event.message) {
 					currentResult.messages.push(event.message as Message);
+					if (h) h.currentTool = undefined;
 					emitUpdate();
 				}
 			};
@@ -3506,6 +3519,10 @@ export default function (pi: ExtensionAPI) {
 				const collapsed = task.replace(/\s+/g, " ").trim();
 				return collapsed.length > 60 ? collapsed.slice(0, 60) + "\u2026" : collapsed;
 			};
+			const previewShort = (task: string): string => {
+				const collapsed = task.replace(/\s+/g, " ").trim();
+				return collapsed.length > 40 ? collapsed.slice(0, 40) + "\u2026" : collapsed;
+			};
 
 			const fg = listForegroundAgents();
 			const bg = [...backgroundAgents.values()].filter(
@@ -3520,7 +3537,7 @@ export default function (pi: ExtensionAPI) {
 			const sections: string[] = [];
 			if (fg.length > 0) {
 				const lines = fg.map(
-					(h) => `  ${h.id}  ${h.agentName}  ${formatElapsed(h.startTime)}  ${preview(h.task)}`,
+					(h) => `  ${h.id}  ${h.agentName}  ${formatElapsed(h.startTime)}  ${h.currentTool ? `tool:${h.currentTool}` : "(awaiting model)"}  idle:${formatElapsed(h.lastEventAt)}  ${previewShort(h.task)}`,
 				);
 				sections.push("Foreground:\n" + lines.join("\n"));
 			}
