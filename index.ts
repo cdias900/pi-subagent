@@ -454,6 +454,28 @@ interface BackgroundAgent {
 	groupId?: string;
 }
 
+interface ForegroundAgentHandle {
+	id: string;
+	agentName: string;
+	task: string;
+	proc: ChildProcess | null;
+	controller: AbortController;
+	startTime: number;
+}
+const foregroundAgents = new Map<string, ForegroundAgentHandle>();
+let foregroundAgentSeq = 0;
+
+function listForegroundAgents(): ForegroundAgentHandle[] {
+	return [...foregroundAgents.values()];
+}
+
+function killForegroundAgent(id: string): boolean {
+	const h = foregroundAgents.get(id);
+	if (!h) return false;
+	h.controller.abort();
+	return true;
+}
+
 const backgroundAgents = new Map<string, BackgroundAgent>();
 const bgAutoCounter = new Map<string, number>();
 let sessionModelOverrides: SubagentModelConfig = {};
@@ -872,6 +894,13 @@ async function runSingleAgent(
 	const runtimeExtensions = invocation.extensions;
 	const teamName = invocation.teamName;
 
+	const runId = `fg-${++foregroundAgentSeq}`;
+	const runController = new AbortController();
+	if (signal) {
+		if (signal.aborted) runController.abort();
+		else signal.addEventListener("abort", () => runController.abort(), { once: true });
+	}
+
 	const args: string[] = ["--mode", "json", "-p", "--no-session", "--no-extensions"];
 
 	// Merge extensions from agent frontmatter and runtime (orchestrator) request, deduplicate
@@ -983,6 +1012,7 @@ async function runSingleAgent(
 				stdio: ["ignore", "pipe", "pipe"],
 				...(spawnEnv ? { env: spawnEnv } : {}),
 			});
+			foregroundAgents.set(runId, { id: runId, agentName, task, proc, controller: runController, startTime: Date.now() });
 			let buffer = "";
 
 			const processLine = (line: string) => {
@@ -1045,23 +1075,22 @@ async function runSingleAgent(
 				resolve(1);
 			});
 
-			if (signal) {
-				const killProc = () => {
-					wasAborted = true;
-					proc.kill("SIGTERM");
-					setTimeout(() => {
-						if (!proc.killed) proc.kill("SIGKILL");
-					}, 5000);
-				};
-				if (signal.aborted) killProc();
-				else signal.addEventListener("abort", killProc, { once: true });
-			}
+			const killProc = () => {
+				wasAborted = true;
+				proc.kill("SIGTERM");
+				setTimeout(() => {
+					if (!proc.killed) proc.kill("SIGKILL");
+				}, 5000);
+			};
+			if (runController.signal.aborted) killProc();
+			else runController.signal.addEventListener("abort", killProc, { once: true });
 		});
 
 		currentResult.exitCode = exitCode;
 		if (wasAborted) throw new Error("Subagent was aborted");
 		return currentResult;
 	} finally {
+		foregroundAgents.delete(runId);
 		// Stop elapsed time ticker
 		if (elapsedInterval) clearInterval(elapsedInterval);
 
