@@ -448,13 +448,13 @@ These changes modify existing behavior:
 
 ### Concurrency limits
 
-A parallel `subagent` call accepts up to 50 agents and runs all of them at once — the cap on how many you can declare and the worker-pool size are the same number, so a full fan-out starts immediately rather than queueing. Override it with the `PI_SUBAGENT_MAX_AGENTS` environment variable.
+A parallel `subagent` call accepts up to 50 agents and runs all of them at once — the cap on how many you can declare and the worker-pool size are the same number, so a full fan-out starts immediately rather than queueing. The same limit governs background agents: background jobs beyond the limit are queued and start automatically as running slots free up. Override it with the `PI_SUBAGENT_MAX_AGENTS` environment variable.
 
 Each agent is a full `pi` child process (~150MB) making its own LLM calls, so a large fan-out costs memory and pushes against provider rate limits. Lower it if you see agents stalling on the model.
 
 | Env var | Default | Purpose |
 |---------|---------|---------|
-| `PI_SUBAGENT_MAX_AGENTS` | `50` | Max agents in a parallel call, and how many run concurrently |
+| `PI_SUBAGENT_MAX_AGENTS` | `50` | Max agents in a parallel call, and how many run concurrently (foreground and background combined) |
 
 ## Commands
 

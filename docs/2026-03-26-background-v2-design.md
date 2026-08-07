@@ -19,7 +19,7 @@ Extend `background: true` from single mode to parallel and chain modes. Backgrou
 | Chain failure | Stop on error | Matches blocking chain behavior |
 | Chain step advancement | Auto-start next step | Background = autonomous; manual approval defeats the purpose |
 | Notification granularity | Configurable via `notifyPerTask` param (default: true) | Per-member by default for visibility; group-only when parent wants less noise |
-| Concurrency | Shared pool (max 8 total) | Parallel members compete for slots like individual agents |
+| Concurrency | Shared pool (`MAX_PARALLEL_AGENTS`) | Parallel members compete for slots like individual agents |
 | Widget display | One line per group | Keeps widget clean; details via `subagent_status` |
 | Steer for parallel groups | Target individual member only | Steering "all at once" is rarely meaningful |
 | Steer for chain groups | Target the active step | Natural — there's only one running agent |
@@ -373,7 +373,7 @@ The `updateBgWidget` function iterates both `backgroundGroups` and `backgroundAg
 
 ## Concurrency
 
-Groups participate in the shared `MAX_BG_CONCURRENCY` (8) pool:
+Groups participate in the shared `MAX_PARALLEL_AGENTS` pool:
 
 - **Parallel:** Each member is an independent agent competing for slots. A parallel group of 4 uses 4 slots. If only 2 slots are available, 2 members launch and 2 queue. Queued members drain normally via `trySpawnQueued`.
 - **Chain:** Only the current step is running — uses 1 slot. When a step completes and the next launches, it reuses the freed slot immediately (or queues if pool is full from other work).

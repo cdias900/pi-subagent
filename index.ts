@@ -197,15 +197,14 @@ function readPositiveIntEnv(name: string, fallback: number): number {
 }
 
 /**
- * Maximum agents in a single parallel `subagent` call, and how many run at
- * once — these are deliberately the same number. Each agent is a full `pi`
- * child process (~150MB) making its own LLM calls, so raising this costs
- * memory and pushes harder against provider rate limits. Override with
- * PI_SUBAGENT_MAX_AGENTS.
+ * The single concurrency limit for this extension, covering both the number
+ * of agents in one parallel `subagent` call and how many background agents
+ * run at once. Each agent is a full `pi` child process (~150MB) making its
+ * own LLM calls, so raising this costs memory and pushes harder against
+ * provider rate limits. Override with PI_SUBAGENT_MAX_AGENTS.
  */
 const MAX_PARALLEL_AGENTS = readPositiveIntEnv("PI_SUBAGENT_MAX_AGENTS", 50);
 const COLLAPSED_ITEM_COUNT = 10;
-const MAX_BG_CONCURRENCY = 8;
 const MAX_COMPLETED_RETENTION = 20;
 
 function formatTokens(count: number): string {
@@ -1741,7 +1740,7 @@ function advanceChain(group: BackgroundGroup): void {
 	}
 
 	const runningCount = [...backgroundAgents.values()].filter((a) => a.status === "running" || a.status === "waiting").length;
-	if (runningCount < MAX_BG_CONCURRENCY) {
+	if (runningCount < MAX_PARALLEL_AGENTS) {
 		bgAgent.status = "running";
 		launchBackgroundAgent(bgAgent);
 	}
@@ -1792,7 +1791,7 @@ function launchBackgroundParallel(
 		const spawnArgs = buildBgSpawnArgs(agentConfig, invocation.resolvedModel, invocation.mcps, invocation.extensions, teamName);
 
 		const runningCount = [...backgroundAgents.values()].filter((a) => a.status === "running" || a.status === "waiting").length;
-		const initialStatus = runningCount >= MAX_BG_CONCURRENCY ? "queued" as const : "running" as const;
+		const initialStatus = runningCount >= MAX_PARALLEL_AGENTS ? "queued" as const : "running" as const;
 		if (initialStatus === "queued") queuedCount++;
 
 		const bgAgent: BackgroundAgent = {
@@ -1909,7 +1908,7 @@ function launchBackgroundChain(
 	const spawnArgs = buildBgSpawnArgs(agentConfig, invocation.resolvedModel, invocation.mcps, invocation.extensions, teamName);
 
 	const runningCount = [...backgroundAgents.values()].filter((a) => a.status === "running" || a.status === "waiting").length;
-	const initialStatus = runningCount >= MAX_BG_CONCURRENCY ? "queued" as const : "running" as const;
+	const initialStatus = runningCount >= MAX_PARALLEL_AGENTS ? "queued" as const : "running" as const;
 
 	const bgAgent: BackgroundAgent = {
 		id: memberId,
@@ -2021,7 +2020,7 @@ function trySpawnQueued(): void {
 		(a) => a.status === "running" || a.status === "waiting",
 	).length;
 
-	if (runningCount >= MAX_BG_CONCURRENCY) return;
+	if (runningCount >= MAX_PARALLEL_AGENTS) return;
 
 	// Find first queued agent
 	for (const bgAgent of backgroundAgents.values()) {
@@ -2728,7 +2727,7 @@ export default function (pi: ExtensionAPI) {
 							...buildResolvedModelMetadata(invocation.resolvedModel),
 							startTime: Date.now(),
 						},
-						status: runningCount >= MAX_BG_CONCURRENCY ? "queued" : "running",
+						status: runningCount >= MAX_PARALLEL_AGENTS ? "queued" : "running",
 						startTime: Date.now(),
 						cwd: invocation.cwd ?? ctx.cwd,
 						agentConfig: invocation.agent,
@@ -2763,7 +2762,7 @@ export default function (pi: ExtensionAPI) {
 								type: "text",
 								text:
 									bgAgent.status === "queued"
-										? `Background agent queued: ${jobId} (${bgAgent.agent})\nStatus: queued — ${runningCount}/${MAX_BG_CONCURRENCY} slots in use\nUse subagent_status(id: "${jobId}") to check progress.`
+										? `Background agent queued: ${jobId} (${bgAgent.agent})\nStatus: queued — ${runningCount}/${MAX_PARALLEL_AGENTS} slots in use\nUse subagent_status(id: "${jobId}") to check progress.`
 										: `Background agent started: ${jobId} (${bgAgent.agent})\nStatus: running\nUse subagent_status(id: "${jobId}") to check progress.`,
 							},
 						],
