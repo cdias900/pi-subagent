@@ -917,7 +917,7 @@ async function runSingleAgent(
 		task,
 		promptKind: invocation.promptKind,
 		input: invocation.input,
-		exitCode: 0,
+		exitCode: -1, // -1 = still running; set to the real code at process close
 		messages: [],
 		stderr: "",
 		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
@@ -1039,7 +1039,9 @@ async function runSingleAgent(
 				resolve(code ?? 0);
 			});
 
-			proc.on("error", () => {
+			proc.on("error", (err) => {
+				currentResult.stderr += `spawn failed: ${err instanceof Error ? err.message : String(err)}`;
+				currentResult.errorMessage = `spawn failed: ${err instanceof Error ? err.message : String(err)}`;
 				resolve(1);
 			});
 
@@ -2500,36 +2502,51 @@ export default function (pi: ExtensionAPI) {
 				const results = await mapWithConcurrencyLimit(invocations, MAX_CONCURRENCY, async (invocation, index) => {
 					const outputName = invocation.saveAs || invocation.agentName;
 
-					const result = await runSingleAgent(
-						ctx.cwd, invocation, signal,
-						(partial) => {
-							if (partial.details?.results[0]) {
-								allResults[index] = partial.details.results[0];
-								emitParallelUpdate();
+					try {
+						const result = await runSingleAgent(
+							ctx.cwd, invocation, signal,
+							(partial) => {
+								if (partial.details?.results[0]) {
+									allResults[index] = partial.details.results[0];
+									emitParallelUpdate();
+								}
+							},
+							makeDetails("parallel")
+						);
+
+						// Team mode: save named output
+						if (teamName && result.exitCode === 0) {
+							const output = getFinalOutput(result.messages);
+							if (output) {
+								saveOutput(teamName, outputName, output);
+								result.savedAs = outputName;
 							}
-						},
-						makeDetails("parallel")
-					);
-
-					// Team mode: save named output
-					if (teamName && result.exitCode === 0) {
-						const output = getFinalOutput(result.messages);
-						if (output) {
-							saveOutput(teamName, outputName, output);
-							result.savedAs = outputName;
 						}
-					}
 
-					allResults[index] = result;
-					emitParallelUpdate();
-					return result;
+						allResults[index] = result;
+						emitParallelUpdate();
+						return result;
+					} catch (err) {
+						// A single failed task must not discard the whole batch:
+						// synthesize a FAILED RESULT mirroring the placeholder shape.
+						const failed: SingleResult = {
+							...allResults[index],
+							exitCode: 1,
+							stderr: err instanceof Error ? err.message : String(err),
+						};
+						allResults[index] = failed;
+						emitParallelUpdate();
+						return failed;
+					}
 				});
 
 				const successCount = results.filter((r) => r.exitCode === 0).length;
 				const summaries = results.map((r) => {
 					const output = getFinalOutput(r.messages);
+					const failed = r.exitCode !== 0;
+					const fallback = failed ? (r.stderr ?? "").slice(0, 200) : "";
 					const preview = output.slice(0, 100) + (output.length > 100 ? "..." : "");
-					return `[${r.agent}] ${r.exitCode === 0 ? "completed" : "failed"}: ${preview || "(no output)"}`;
+					return `[${r.agent}] ${r.exitCode === 0 ? "completed" : "failed"}: ${preview || fallback || "(no output)"}`;
 				});
 				return {
 					content: [
@@ -2747,8 +2764,9 @@ export default function (pi: ExtensionAPI) {
 				const r = details.results[0];
 				const resultText = result.content[0]?.type === "text" ? result.content[0].text : "";
 				const isBackground = resultText.startsWith("Background agent started") || resultText.startsWith("Background agent queued");
-				const isError = !isBackground && (r.exitCode !== 0 || r.stopReason === "error" || r.stopReason === "aborted");
-				const icon = isBackground ? "🏃" : isError ? theme.fg("error", "✗") : theme.fg("success", "✓");
+				const isRunning = !isBackground && r.exitCode === -1;
+				const isError = !isBackground && !isRunning && (r.exitCode !== 0 || r.stopReason === "error" || r.stopReason === "aborted");
+				const icon = isBackground ? "🏃" : isRunning ? theme.fg("warning", "⏳") : isError ? theme.fg("error", "✗") : theme.fg("success", "✓");
 				const displayItems = getDisplayItems(r.messages);
 				const finalOutput = getFinalOutput(r.messages);
 
@@ -2853,7 +2871,7 @@ export default function (pi: ExtensionAPI) {
 					);
 
 					for (const r of details.results) {
-						const rIcon = r.exitCode === 0 ? theme.fg("success", "✓") : theme.fg("error", "✗");
+						const rIcon = r.exitCode === -1 ? theme.fg("warning", "⏳") : r.exitCode === 0 ? theme.fg("success", "✓") : theme.fg("error", "✗");
 						const displayItems = getDisplayItems(r.messages);
 						const finalOutput = getFinalOutput(r.messages);
 
@@ -2913,7 +2931,7 @@ export default function (pi: ExtensionAPI) {
 					theme.fg("toolTitle", theme.bold("chain ")) +
 					theme.fg("accent", `${successCount}/${details.results.length} steps`);
 				for (const r of details.results) {
-					const rIcon = r.exitCode === 0 ? theme.fg("success", "✓") : theme.fg("error", "✗");
+					const rIcon = r.exitCode === -1 ? theme.fg("warning", "⏳") : r.exitCode === 0 ? theme.fg("success", "✓") : theme.fg("error", "✗");
 					const displayItems = getDisplayItems(r.messages);
 					text += `\n\n${theme.fg("muted", `─── Step ${r.step}: `)}${theme.fg("accent", r.agent)} ${rIcon}`;
 					if (displayItems.length === 0) text += `\n${theme.fg("muted", "(no output)")}`;
