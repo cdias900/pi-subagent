@@ -30,6 +30,7 @@ import { Container, Markdown, Spacer, Text } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
 import { type AgentConfig, type AgentDiscoveryResult, type AgentScope, discoverAgents } from "./agents.js";
 import { registerAgentModelCommand } from "./agent-model-command.js";
+import { AgentsPanel, type PanelAgent, type TranscriptEntry } from "./agents-panel.js";
 import { registerCoordinationTools } from "./coordination.js";
 import {
 	buildCompactAgentInfo,
@@ -464,6 +465,7 @@ interface ForegroundAgentHandle {
 	lastEventAt: number;
 	currentTool?: string;
 	turns: number;
+	result?: SingleResult;
 }
 const foregroundAgents = new Map<string, ForegroundAgentHandle>();
 let foregroundAgentSeq = 0;
@@ -731,6 +733,67 @@ function getDisplayItems(messages: Message[]): DisplayItem[] {
 		}
 	}
 	return items;
+}
+
+/** Truncate a string to a maximum length, appending an ellipsis. */
+function truncateText(text: string, max: number): string {
+	const trimmed = text.trim();
+	if (trimmed.length <= max) return trimmed;
+	return `${trimmed.slice(0, max)}…`;
+}
+
+/**
+ * Build a structured conversation transcript for the agents panel right pane.
+ *
+ * Emits, in order: the initial prompt, then every turn — assistant text, tool
+ * calls, and tool results — so the expanded view shows the agent's full history
+ * rather than only its final reply. Tool results are capped so a single huge
+ * result cannot dominate the pane.
+ */
+function buildTranscript(task: string, messages: Message[], resultLimit = 400): TranscriptEntry[] {
+	const entries: TranscriptEntry[] = [];
+
+	// Prefer the real user messages as the prompt entries — the agent's first
+	// user message is the untruncated task (often `Task: <full text>`), while the
+	// `task` argument is a truncated display string. Emitting both produced a
+	// duplicate, truncated-then-full prompt. Only fall back to the synthetic
+	// `task` entry when no user messages have been captured yet.
+	let hasUserText = false;
+	for (const msg of messages) {
+		if (msg.role === "user") {
+			const parts = Array.isArray(msg.content) ? msg.content : [msg.content];
+			for (const part of parts) {
+				const text = typeof part === "string" ? part : part.type === "text" ? part.text : "";
+				if (!text) continue;
+				hasUserText = true;
+				entries.push({ kind: "prompt", text });
+			}
+		} else if (msg.role === "assistant") {
+			for (const part of msg.content) {
+				if (part.type === "text") {
+					if (part.text.trim()) entries.push({ kind: "assistant", text: part.text });
+				} else if (part.type === "toolCall") {
+					const plain = formatToolCall(part.name, part.arguments, (_c, s) => s);
+					entries.push({ kind: "tool", text: truncateText(plain, 120) });
+				}
+				// thinking parts are ignored
+			}
+		} else if (msg.role === "toolResult") {
+			for (const part of msg.content) {
+				if (part.type === "text" && part.text.trim()) {
+					entries.push({ kind: "result", text: truncateText(part.text, resultLimit) });
+				}
+			}
+		}
+	}
+
+	// No user messages captured yet (agent spawned but nothing streamed back):
+	// fall back to the synthetic truncated task entry so the pane isn't blank.
+	if (!hasUserText) {
+		entries.unshift({ kind: "prompt", text: task });
+	}
+
+	return entries;
 }
 
 async function mapWithConcurrencyLimit<TIn, TOut>(
@@ -1015,7 +1078,7 @@ async function runSingleAgent(
 				stdio: ["ignore", "pipe", "pipe"],
 				...(spawnEnv ? { env: spawnEnv } : {}),
 			});
-			foregroundAgents.set(runId, { id: runId, agentName, task, proc, controller: runController, startTime: Date.now(), lastEventAt: Date.now(), turns: 0 });
+			foregroundAgents.set(runId, { id: runId, agentName, task, proc, controller: runController, startTime: Date.now(), lastEventAt: Date.now(), turns: 0, result: currentResult });
 			let buffer = "";
 
 			const processLine = (line: string) => {
@@ -2826,22 +2889,24 @@ export default function (pi: ExtensionAPI) {
 					container.addChild(new Text(theme.fg("dim", r.task), 0, 0));
 					container.addChild(new Spacer(1));
 					container.addChild(new Text(theme.fg("muted", "─── Output ───"), 0, 0));
-					if (displayItems.length === 0 && !finalOutput) {
+					const transcript = buildTranscript(r.task, r.messages, 2000);
+					if (transcript.length === 0) {
 						container.addChild(new Text(theme.fg("muted", "(no output)"), 0, 0));
 					} else {
-						for (const item of displayItems) {
-							if (item.type === "toolCall")
-								container.addChild(
-									new Text(
-										theme.fg("muted", "→ ") + formatToolCall(item.name, item.args, theme.fg.bind(theme)),
-										0,
-										0,
-									),
-								);
-						}
-						if (finalOutput) {
+						for (const entry of transcript) {
+							if (entry.kind === "prompt") {
+								container.addChild(new Text(theme.fg("muted", "▸ prompt"), 0, 0));
+								for (const line of entry.text.split("\n"))
+									container.addChild(new Text(theme.fg("dim", line), 0, 0));
+							} else if (entry.kind === "assistant") {
+								container.addChild(new Markdown(entry.text.trim(), 0, 0, mdTheme));
+							} else if (entry.kind === "tool") {
+								container.addChild(new Text(theme.fg("muted", "→ ") + theme.fg("toolOutput", entry.text), 0, 0));
+							} else if (entry.kind === "result") {
+								for (const line of entry.text.split("\n"))
+									container.addChild(new Text(theme.fg("dim", "  ⤷ " + line), 0, 0));
+							}
 							container.addChild(new Spacer(1));
-							container.addChild(new Markdown(finalOutput.trim(), 0, 0, mdTheme));
 						}
 					}
 					const usageStr = formatUsageStats(r.usage, r.model ?? r.resolvedModel, {
@@ -2928,23 +2993,25 @@ export default function (pi: ExtensionAPI) {
 						const label = r.promptKind === "input" ? "Input: " : "Task: ";
 						container.addChild(new Text(theme.fg("muted", label) + theme.fg("dim", r.task), 0, 0));
 
-						// Show tool calls
-						for (const item of displayItems) {
-							if (item.type === "toolCall") {
-								container.addChild(
-									new Text(
-										theme.fg("muted", "→ ") + formatToolCall(item.name, item.args, theme.fg.bind(theme)),
-										0,
-										0,
-									),
-								);
+						const transcript = buildTranscript(r.task, r.messages, 2000);
+						if (transcript.length === 0) {
+							container.addChild(new Text(theme.fg("muted", "(no output)"), 0, 0));
+						} else {
+							for (const entry of transcript) {
+								if (entry.kind === "prompt") {
+									container.addChild(new Text(theme.fg("muted", "▸ prompt"), 0, 0));
+									for (const line of entry.text.split("\n"))
+										container.addChild(new Text(theme.fg("dim", line), 0, 0));
+								} else if (entry.kind === "assistant") {
+									container.addChild(new Markdown(entry.text.trim(), 0, 0, mdTheme));
+								} else if (entry.kind === "tool") {
+									container.addChild(new Text(theme.fg("muted", "→ ") + theme.fg("toolOutput", entry.text), 0, 0));
+								} else if (entry.kind === "result") {
+									for (const line of entry.text.split("\n"))
+										container.addChild(new Text(theme.fg("dim", "  ⤷ " + line), 0, 0));
+								}
+								container.addChild(new Spacer(1));
 							}
-						}
-
-						// Show final output as markdown
-						if (finalOutput) {
-							container.addChild(new Spacer(1));
-							container.addChild(new Markdown(finalOutput.trim(), 0, 0, mdTheme));
 						}
 
 						const stepUsage = formatUsageStats(r.usage, r.model ?? r.resolvedModel, {
@@ -3023,23 +3090,25 @@ export default function (pi: ExtensionAPI) {
 						const label = r.promptKind === "input" ? "Input: " : "Task: ";
 						container.addChild(new Text(theme.fg("muted", label) + theme.fg("dim", r.task), 0, 0));
 
-						// Show tool calls
-						for (const item of displayItems) {
-							if (item.type === "toolCall") {
-								container.addChild(
-									new Text(
-										theme.fg("muted", "→ ") + formatToolCall(item.name, item.args, theme.fg.bind(theme)),
-										0,
-										0,
-									),
-								);
+						const transcript = buildTranscript(r.task, r.messages, 2000);
+						if (transcript.length === 0) {
+							container.addChild(new Text(theme.fg("muted", "(no output)"), 0, 0));
+						} else {
+							for (const entry of transcript) {
+								if (entry.kind === "prompt") {
+									container.addChild(new Text(theme.fg("muted", "▸ prompt"), 0, 0));
+									for (const line of entry.text.split("\n"))
+										container.addChild(new Text(theme.fg("dim", line), 0, 0));
+								} else if (entry.kind === "assistant") {
+									container.addChild(new Markdown(entry.text.trim(), 0, 0, mdTheme));
+								} else if (entry.kind === "tool") {
+									container.addChild(new Text(theme.fg("muted", "→ ") + theme.fg("toolOutput", entry.text), 0, 0));
+								} else if (entry.kind === "result") {
+									for (const line of entry.text.split("\n"))
+										container.addChild(new Text(theme.fg("dim", "  ⤷ " + line), 0, 0));
+								}
+								container.addChild(new Spacer(1));
 							}
-						}
-
-						// Show final output as markdown
-						if (finalOutput) {
-							container.addChild(new Spacer(1));
-							container.addChild(new Markdown(finalOutput.trim(), 0, 0, mdTheme));
 						}
 
 						const taskUsage = formatUsageStats(r.usage, r.model ?? r.resolvedModel, {
@@ -3509,46 +3578,94 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("agents", {
 		description: "List currently running agents (foreground and background) with their ids.",
 		handler: async (_args, ctx) => {
-			const formatElapsed = (start: number): string => {
-				const secs = Math.max(0, Math.floor((Date.now() - start) / 1000));
-				const m = Math.floor(secs / 60);
-				const s = secs % 60;
-				return m > 0 ? `${m}m ${s.toString().padStart(2, "0")}s` : `${s}s`;
-			};
-			const preview = (task: string): string => {
-				const collapsed = task.replace(/\s+/g, " ").trim();
-				return collapsed.length > 60 ? collapsed.slice(0, 60) + "\u2026" : collapsed;
-			};
-			const previewShort = (task: string): string => {
-				const collapsed = task.replace(/\s+/g, " ").trim();
-				return collapsed.length > 40 ? collapsed.slice(0, 40) + "\u2026" : collapsed;
-			};
-
-			const fg = listForegroundAgents();
-			const bg = [...backgroundAgents.values()].filter(
-				(a) => a.status === "running" || a.status === "queued" || a.status === "waiting",
-			);
-
-			if (fg.length === 0 && bg.length === 0) {
-				ctx.ui.notify("No agents are currently running.", "info");
-				return;
-			}
-
-			const sections: string[] = [];
-			if (fg.length > 0) {
-				const lines = fg.map(
-					(h) => `  ${h.id}  ${h.agentName}  ${formatElapsed(h.startTime)}  ${h.currentTool ? `tool:${h.currentTool}` : "(awaiting model)"}  idle:${formatElapsed(h.lastEventAt)}  ${previewShort(h.task)}`,
+			// Overlay width is fixed at creation, so to switch between the narrow
+			// list and the wider two-pane expanded view we mirror pier: close the
+			// overlay and reopen it at the new width, preserving the selection.
+			let mode: "list" | "expanded" = "list";
+			let selected = 0;
+			let open = true;
+			while (open) {
+				const nextMode: "list" | "expanded" | null = await ctx.ui.custom<"list" | "expanded" | null>(
+					(tui, theme, _keybindings, done) => {
+						let panel: AgentsPanel;
+						panel = new AgentsPanel({
+							theme,
+							mode,
+							initialSelectedIndex: selected,
+							getAgents: () => {
+							const agents: PanelAgent[] = [];
+							for (const h of listForegroundAgents()) {
+								agents.push({
+									id: h.id,
+									origin: "foreground",
+									agentName: h.agentName,
+									task: h.task,
+									startTime: h.startTime,
+									lastEventAt: h.lastEventAt,
+									currentTool: h.currentTool,
+									status: "running",
+									output: h.result ? getFinalOutput(h.result.messages) : "",
+									transcript: h.result ? buildTranscript(h.task, h.result.messages) : [{ kind: "prompt", text: h.task }],
+								});
+							}
+							for (const a of backgroundAgents.values()) {
+								if (a.status !== "running" && a.status !== "queued" && a.status !== "waiting") continue;
+								agents.push({
+									id: a.id,
+									origin: "background",
+									agentName: a.agent,
+									task: a.task,
+									startTime: a.startTime,
+									status: a.status,
+									output: getFinalOutput(a.result.messages),
+									transcript: buildTranscript(a.task, a.result.messages),
+								});
+							}
+							return agents;
+						},
+						onKill: (id) => {
+							if (killForegroundAgent(id)) return true;
+							const bgAgent = backgroundAgents.get(id);
+							if (bgAgent && (bgAgent.status === "running" || bgAgent.status === "queued" || bgAgent.status === "waiting")) {
+								const wasQueued = bgAgent.status === "queued";
+								bgAgent.status = "aborted";
+								bgAgent.endTime = Date.now();
+								if (!wasQueued) {
+									killBgProcess(bgAgent);
+								}
+								updateBgWidget();
+								trySpawnQueued();
+								return true;
+							}
+							return false;
+						},
+							onExpand: () => { selected = panel.selected; done("expanded"); },
+							onCollapse: () => { selected = panel.selected; done("list"); },
+							onClose: () => { selected = panel.selected; done(null); },
+							requestRender: () => tui.requestRender(),
+							getHeight: () => {
+								const rows = (tui as { rows?: number }).rows;
+								if (typeof rows === "number" && rows > 0) return rows;
+								const termRows = (tui as { terminal?: { rows?: number } }).terminal?.rows;
+								return typeof termRows === "number" && termRows > 0 ? termRows : 30;
+							},
+						});
+						return panel;
+					},
+					{
+						overlay: true,
+						overlayOptions: () => ({
+							anchor: "top-right" as const,
+							width: mode === "expanded" ? "60%" : "32%",
+							minWidth: mode === "expanded" ? 70 : 34,
+							maxHeight: "100%",
+							margin: { right: 0, top: 0 },
+						}),
+					},
 				);
-				sections.push("Foreground:\n" + lines.join("\n"));
+				if (nextMode === null || nextMode === undefined) open = false;
+				else mode = nextMode;
 			}
-			if (bg.length > 0) {
-				const lines = bg.map(
-					(a) => `  ${a.id}  ${a.agent}  ${formatElapsed(a.startTime)}  ${preview(a.task)}`,
-				);
-				sections.push("Background:\n" + lines.join("\n"));
-			}
-			sections.push("Kill one with: /kill-agent <id>");
-			ctx.ui.notify(sections.join("\n"), "info");
 		},
 	});
 
