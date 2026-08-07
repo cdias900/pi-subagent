@@ -121,6 +121,7 @@ export class AgentsPanel implements Component {
 	private selectedIndex = 0;
 	private scrollOffset = 0; // lines scrolled UP from the bottom (expanded mode only)
 	private followBottom = true; // when true, pin to newest content regardless of scrollOffset
+	private listScrollOffset = 0; // index of the FIRST VISIBLE AGENT in list mode (an agent index, not a line index)
 
 	constructor(opts: AgentsPanelOptions) {
 		this.theme = opts.theme;
@@ -180,24 +181,70 @@ export class AgentsPanel implements Component {
 	/** "list" mode: the narrow single-column sidebar. */
 	private renderList(width: number, innerWidth: number, height: number, agents: PanelAgent[]): string[] {
 		const compact = innerWidth < COMPACT_WIDTH_THRESHOLD;
-		const footerHint = compact ? "↑↓ ⏎ out  k kill  q close" : "↑↓ select   ⏎ output   k kill   q close";
+		const footerHint = "↑↓/PgUp/PgDn   ⏎ output   k kill   q close";
 		const runningCount = agents.filter((a) => a.status === "running").length;
-		const title = `agents — ${runningCount} running`;
 
 		// Build the content lines (everything between the top and bottom borders).
 		// These are raw inner-width strings; padRow wraps them with borders later.
 		const content: string[] = [];
 
 		if (agents.length === 0) {
+			this.listScrollOffset = 0;
 			content.push(this.fg("muted", "No agents running."));
 		} else {
 			// Clamp selection into bounds each render so a shrunk list can't point past the end.
 			if (this.selectedIndex >= agents.length) this.selectedIndex = agents.length - 1;
 			if (this.selectedIndex < 0) this.selectedIndex = 0;
 
-			for (let i = 0; i < agents.length; i++) {
-				const a = agents[i];
-				const selected = i === this.selectedIndex;
+			// ── Scrolling viewport ──────────────────────────────────────────────
+			// linesPerAgent mirrors the row layout chosen below (2 lines when
+			// compact, 1 otherwise). bodySlots matches what composeBordered
+			// reserves for content once the footer line is pinned.
+			const linesPerAgent = compact ? 2 : 1;
+			const available = height - 2;
+			const bodySlots = Math.max(1, available - 1);
+
+			// Given a number of reserved indicator lines (0, 1, or 2 — the "↑ N
+			// more" / "↓ N more" rows), compute how many agent rows fit, clamp
+			// the viewport (this.listScrollOffset) so the current selection stays
+			// visible, and report which indicators are actually needed for that
+			// viewport. Shrinking the viewport can only ever make more indicators
+			// necessary (never fewer), so re-evaluating at most twice always
+			// reaches a fixed point — no unbounded loop.
+			const settle = (indicatorLines: number) => {
+				const visibleCount = Math.max(1, Math.floor((bodySlots - indicatorLines) / linesPerAgent));
+				if (this.selectedIndex < this.listScrollOffset) this.listScrollOffset = this.selectedIndex;
+				if (this.selectedIndex >= this.listScrollOffset + visibleCount) {
+					this.listScrollOffset = this.selectedIndex - visibleCount + 1;
+				}
+				this.listScrollOffset = Math.max(
+					0,
+					Math.min(this.listScrollOffset, Math.max(0, agents.length - visibleCount)),
+				);
+				const hasMoreAbove = this.listScrollOffset > 0;
+				const hasMoreBelow = this.listScrollOffset + visibleCount < agents.length;
+				return { visibleCount, hasMoreAbove, hasMoreBelow };
+			};
+
+			let viewport = settle(0);
+			let indicatorLines = (viewport.hasMoreAbove ? 1 : 0) + (viewport.hasMoreBelow ? 1 : 0);
+			if (indicatorLines > 0) {
+				viewport = settle(indicatorLines);
+				const nextIndicatorLines = (viewport.hasMoreAbove ? 1 : 0) + (viewport.hasMoreBelow ? 1 : 0);
+				if (nextIndicatorLines !== indicatorLines) {
+					viewport = settle(nextIndicatorLines);
+				}
+			}
+			const { visibleCount, hasMoreAbove, hasMoreBelow } = viewport;
+
+			if (hasMoreAbove) {
+				content.push(this.fg("muted", `↑ ${this.listScrollOffset} more`));
+			}
+
+			const visibleAgents = agents.slice(this.listScrollOffset, this.listScrollOffset + visibleCount);
+			for (let i = 0; i < visibleAgents.length; i++) {
+				const a = visibleAgents[i];
+				const selected = this.listScrollOffset + i === this.selectedIndex;
 				const marker = selected ? "▸ " : "  ";
 				const icon = this.fg(statusColor(a.status), statusIcon(a.status));
 				const id = this.fg("accent", a.id);
@@ -238,7 +285,15 @@ export class AgentsPanel implements Component {
 					content.push(selected ? this.fg("text", row) : row);
 				}
 			}
+
+			if (hasMoreBelow) {
+				content.push(this.fg("muted", `↓ ${agents.length - (this.listScrollOffset + visibleCount)} more`));
+			}
 		}
+
+		const title = agents.length > 0
+			? `agents — ${runningCount} running · ${this.selectedIndex + 1}/${agents.length}`
+			: `agents — ${runningCount} running`;
 
 		return this.composeBordered(title, footerHint, content, width, innerWidth, height);
 	}
@@ -544,6 +599,40 @@ export class AgentsPanel implements Component {
 				}
 				this.scrollOffset = 0;
 				this.followBottom = true;
+				this.requestRender();
+				return;
+			}
+		}
+
+		// In list mode, PageUp/PageDown/Home/End move the SELECTION; the viewport
+		// (listScrollOffset) follows automatically in renderList since it's
+		// clamped to keep the selection in view every render.
+		if (this.mode === "list") {
+			if (matchesKey(data, "pageUp")) {
+				const count = this.getAgents().length;
+				if (count === 0) return;
+				this.selectedIndex = Math.max(0, this.selectedIndex - 10);
+				this.requestRender();
+				return;
+			}
+			if (matchesKey(data, "pageDown")) {
+				const count = this.getAgents().length;
+				if (count === 0) return;
+				this.selectedIndex = Math.min(count - 1, this.selectedIndex + 10);
+				this.requestRender();
+				return;
+			}
+			if (matchesKey(data, "home")) {
+				const count = this.getAgents().length;
+				if (count === 0) return;
+				this.selectedIndex = 0;
+				this.requestRender();
+				return;
+			}
+			if (matchesKey(data, "end")) {
+				const count = this.getAgents().length;
+				if (count === 0) return;
+				this.selectedIndex = Math.max(0, count - 1);
 				this.requestRender();
 				return;
 			}
