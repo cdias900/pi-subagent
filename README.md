@@ -409,6 +409,53 @@ Explicit selections are checked against the available, authenticated models and 
 > [!NOTE]
 > The `/agent-model` picker deliberately manages user and bundled agents only. It does not list project-local agents or configure project-specific model policy.
 
+## Monitoring Running Agents
+
+A blocking parallel `subagent` call occupies the turn, so the model cannot call tools to inspect or stop a stuck agent. Slash commands still run mid-turn, which is how these work.
+
+`/agents` opens a full-height sidebar docked to the right, refreshing every 500ms. One row per agent, foreground and background together, showing:
+
+- status icon (⏳ running, ✓ done, ✗ failed/aborted, ⏸ queued/waiting)
+- agent id (`fg-N` for foreground) and agent name
+- elapsed time
+- the in-flight tool (`tool:bash`) or `(awaiting model)`
+- `idle:` — time since that agent last emitted an event
+
+The last two fields are the point of the panel. An agent sitting in `tool:bash` with a climbing idle clock is running a long command and is healthy; `(awaiting model)` with a stale clock means it is wedged waiting on the provider.
+
+| Key | Action |
+|-----|--------|
+| `↑` `↓` | Select agent (list) / scroll transcript (expanded) |
+| `⏎` | Open the selected agent's transcript / return to the list |
+| `Tab` | Next agent (expanded view) |
+| `PgUp` `PgDn` | Scroll transcript by ten lines |
+| `Home` `End` | Jump to oldest / newest output |
+| `k` | Kill the selected agent |
+| `q` `Esc` | Close the panel |
+
+### Transcript view
+
+Pressing Enter widens the overlay and splits it into two panes — agent list left, selected agent's transcript right. The transcript is chronological and complete: the prompt, every assistant turn, each tool call and its result. It follows new output as it streams, but stops following once you scroll up so you can read without being yanked to the bottom; `End` re-pins it. The same chronological transcript now backs the expanded (`Ctrl+O`) tool-call view for single, chain and parallel runs.
+
+### Run status and partial results
+
+These changes modify existing behavior:
+
+- Agents show ⏳ while running and only switch to ✓ when the child process actually exits. Previously a checkmark appeared as soon as an agent produced its first turn.
+- If one task in a parallel batch fails or is aborted, the other tasks' results are still returned, with the failed one marked ✗ and its error shown. Previously a throw from any task rejected the whole call and discarded results from tasks that had already finished. Callers that treated a parallel throw as "nothing ran" should be aware results now come back.
+- Spawn failures report the underlying error (for example `spawn failed: spawn pi ENOENT`) instead of `(no output)`.
+- Each foreground run gets its own abort controller, so `/kill-agent` and the panel's `k` stop exactly one agent. A top-level abort (Escape) still cascades to all of them.
+
+### Concurrency limits
+
+A parallel `subagent` call accepts up to 50 agents and runs all of them at once — the cap on how many you can declare and the worker-pool size are the same number, so a full fan-out starts immediately rather than queueing. Override it with the `PI_SUBAGENT_MAX_AGENTS` environment variable.
+
+Each agent is a full `pi` child process (~150MB) making its own LLM calls, so a large fan-out costs memory and pushes against provider rate limits. Lower it if you see agents stalling on the model.
+
+| Env var | Default | Purpose |
+|---------|---------|---------|
+| `PI_SUBAGENT_MAX_AGENTS` | `50` | Max agents in a parallel call, and how many run concurrently |
+
 ## Commands
 
 | Command | Description |
@@ -424,6 +471,8 @@ Explicit selections are checked against the available, authenticated models and 
 | `/team info <name>` | Show team details and outputs |
 | `/team outputs <name>` | List saved output files |
 | `/team delete <name>` | Delete team and all data |
+| `/agents` | Open the live agents panel (TUI only) |
+| `/kill-agent <id>` | Kill one running agent by id, leaving its siblings running |
 
 ## Subagent Parameters
 

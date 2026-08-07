@@ -138,7 +138,7 @@ function resolveId(id: string): { type: "group"; group: BackgroundGroup }
 
 When `subagent({ tasks: [...], background: true })`:
 
-1. Validate: tasks ≤ `MAX_PARALLEL_TASKS` (8), all agents exist
+1. Validate: tasks ≤ `MAX_PARALLEL_AGENTS` (50), all agents exist
 2. Generate group ID
 3. Create `BackgroundGroup` with mode `"parallel"`
 4. For each task:

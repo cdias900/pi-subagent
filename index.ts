@@ -189,8 +189,21 @@ function findMcpBridgePath(agentDir: string): string | null {
 	return null;
 }
 
-const MAX_PARALLEL_TASKS = 8;
-const MAX_CONCURRENCY = 4;
+function readPositiveIntEnv(name: string, fallback: number): number {
+	const raw = process.env[name];
+	if (raw === undefined) return fallback;
+	const parsed = Number.parseInt(raw, 10);
+	return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+/**
+ * Maximum agents in a single parallel `subagent` call, and how many run at
+ * once — these are deliberately the same number. Each agent is a full `pi`
+ * child process (~150MB) making its own LLM calls, so raising this costs
+ * memory and pushes harder against provider rate limits. Override with
+ * PI_SUBAGENT_MAX_AGENTS.
+ */
+const MAX_PARALLEL_AGENTS = readPositiveIntEnv("PI_SUBAGENT_MAX_AGENTS", 50);
 const COLLAPSED_ITEM_COUNT = 10;
 const MAX_BG_CONCURRENCY = 8;
 const MAX_COMPLETED_RETENTION = 20;
@@ -2414,8 +2427,8 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			if (hasTasks) {
-				if (params.tasks!.length > MAX_PARALLEL_TASKS) {
-					throw new Error(`Too many parallel tasks (${params.tasks!.length}). Max is ${MAX_PARALLEL_TASKS}.`);
+				if (params.tasks!.length > MAX_PARALLEL_AGENTS) {
+					throw new Error(`Too many parallel agents (${params.tasks!.length}). Max is ${MAX_PARALLEL_AGENTS}.`);
 				}
 			}
 
@@ -2604,7 +2617,7 @@ export default function (pi: ExtensionAPI) {
 					}
 				};
 
-				const results = await mapWithConcurrencyLimit(invocations, MAX_CONCURRENCY, async (invocation, index) => {
+				const results = await mapWithConcurrencyLimit(invocations, MAX_PARALLEL_AGENTS, async (invocation, index) => {
 					const outputName = invocation.saveAs || invocation.agentName;
 
 					try {
