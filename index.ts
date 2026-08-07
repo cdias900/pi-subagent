@@ -3491,6 +3491,82 @@ export default function (pi: ExtensionAPI) {
 		shutdownAllBackgroundAgents();
 	});
 
+	// ── Agent management commands ───────────────────────────────────
+
+	pi.registerCommand("agents", {
+		description: "List currently running agents (foreground and background) with their ids.",
+		handler: async (_args, ctx) => {
+			const formatElapsed = (start: number): string => {
+				const secs = Math.max(0, Math.floor((Date.now() - start) / 1000));
+				const m = Math.floor(secs / 60);
+				const s = secs % 60;
+				return m > 0 ? `${m}m ${s.toString().padStart(2, "0")}s` : `${s}s`;
+			};
+			const preview = (task: string): string => {
+				const collapsed = task.replace(/\s+/g, " ").trim();
+				return collapsed.length > 60 ? collapsed.slice(0, 60) + "\u2026" : collapsed;
+			};
+
+			const fg = listForegroundAgents();
+			const bg = [...backgroundAgents.values()].filter(
+				(a) => a.status === "running" || a.status === "queued" || a.status === "waiting",
+			);
+
+			if (fg.length === 0 && bg.length === 0) {
+				ctx.ui.notify("No agents are currently running.", "info");
+				return;
+			}
+
+			const sections: string[] = [];
+			if (fg.length > 0) {
+				const lines = fg.map(
+					(h) => `  ${h.id}  ${h.agentName}  ${formatElapsed(h.startTime)}  ${preview(h.task)}`,
+				);
+				sections.push("Foreground:\n" + lines.join("\n"));
+			}
+			if (bg.length > 0) {
+				const lines = bg.map(
+					(a) => `  ${a.id}  ${a.agent}  ${formatElapsed(a.startTime)}  ${preview(a.task)}`,
+				);
+				sections.push("Background:\n" + lines.join("\n"));
+			}
+			sections.push("Kill one with: /kill-agent <id>");
+			ctx.ui.notify(sections.join("\n"), "info");
+		},
+	});
+
+	pi.registerCommand("kill-agent", {
+		description: "Kill one running agent by id without affecting the others. Usage: /kill-agent <id>",
+		handler: async (args, ctx) => {
+			const id = (args || "").trim();
+			if (!id) {
+				ctx.ui.notify("Usage: /kill-agent <id>  (run /agents to see ids)", "warning");
+				return;
+			}
+
+			if (killForegroundAgent(id)) {
+				ctx.ui.notify(`Killed foreground agent ${id}.`, "info");
+				return;
+			}
+
+			const bgAgent = backgroundAgents.get(id);
+			if (bgAgent && (bgAgent.status === "running" || bgAgent.status === "queued" || bgAgent.status === "waiting")) {
+				const wasQueued = bgAgent.status === "queued";
+				bgAgent.status = "aborted";
+				bgAgent.endTime = Date.now();
+				if (!wasQueued) {
+					killBgProcess(bgAgent);
+				}
+				updateBgWidget();
+				trySpawnQueued();
+				ctx.ui.notify(`Killed background agent ${id}.`, "info");
+				return;
+			}
+
+			ctx.ui.notify(`No running agent with id "${id}". Run /agents to see ids.`, "warning");
+		},
+	});
+
 	// ── Team commands ────────────────────────────────────────────────
 
 	pi.registerCommand("team", {
