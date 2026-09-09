@@ -29,6 +29,7 @@ import {
 import { Container, Markdown, Spacer, Text } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
 import { type AgentConfig, type AgentDiscoveryResult, type AgentScope, discoverAgents } from "./agents.js";
+import { hasTerminalFailure, isSuccessfulResult, processExitCode } from "./result-status.js";
 import { registerAgentModelCommand } from "./agent-model-command.js";
 import { AgentsPanel, type PanelAgent, type TranscriptEntry } from "./agents-panel.js";
 import { registerCoordinationTools } from "./coordination.js";
@@ -410,6 +411,7 @@ interface SingleResult {
 	configSource?: ModelSource;
 	stopReason?: string;
 	errorMessage?: string;
+	completionSignal?: "done" | "error";
 	step?: number;
 	savedAs?: string;
 	startTime: number;
@@ -1154,7 +1156,7 @@ async function runSingleAgent(
 
 			proc.on("close", (code) => {
 				if (buffer.trim()) processLine(buffer);
-				resolve(code ?? 0);
+				resolve(processExitCode(code));
 			});
 
 			proc.on("error", (err) => {
@@ -1426,14 +1428,14 @@ function launchBackgroundAgent(bgAgent: BackgroundAgent): void {
 
 	proc.on("close", (code: number | null) => {
 		if (buffer.trim()) processLine(buffer);
-		bgAgent.result.exitCode = code ?? 0;
+		bgAgent.result.exitCode = processExitCode(code);
 
 		// Only finalize if not already done by __bg_signal
 		if (bgAgent.status === "running" || bgAgent.status === "waiting") {
 			const summary = getFinalOutput(bgAgent.result.messages) || "(no output)";
 			handleBgSignal(
 				bgAgent,
-				code === 0 ? { status: "done", summary } : { status: "error", error: summary },
+				isSuccessfulResult(bgAgent.result) ? { status: "done", summary } : { status: "error", error: summary },
 			);
 		}
 
@@ -1468,11 +1470,16 @@ function launchBackgroundAgent(bgAgent: BackgroundAgent): void {
 	}
 }
 
-function handleBgSignal(bgAgent: BackgroundAgent, args: Record<string, string>): void {
+export function handleBgSignal(bgAgent: BackgroundAgent, args: Record<string, string>): void {
+	// A parsed done tool call cannot overrule the same message's terminal failure.
+	if (args.status === "done" && hasTerminalFailure(bgAgent.result)) {
+		args = { status: "error", error: bgAgent.result.errorMessage || `Model ended with ${bgAgent.result.stopReason}` };
+	}
 	const signalStatus = args.status as "done" | "question" | "error" | undefined;
 	const summary = args.summary || args.question || args.error || "";
 
 	if (signalStatus === "done") {
+		bgAgent.result.completionSignal = "done";
 		bgAgent.status = "done";
 		bgAgent.endTime = Date.now();
 		appendBgUsageEntry(bgAgent, signalStatus);
@@ -1538,6 +1545,7 @@ function handleBgSignal(bgAgent: BackgroundAgent, args: Record<string, string>):
 		);
 		updateBgWidget();
 	} else if (signalStatus === "error") {
+		bgAgent.result.completionSignal = "error";
 		bgAgent.status = "error";
 		bgAgent.endTime = Date.now();
 		appendBgUsageEntry(bgAgent, signalStatus);
@@ -2550,7 +2558,7 @@ export default function (pi: ExtensionAPI) {
 					results.push(result);
 
 					const isError =
-						result.exitCode !== 0 || result.stopReason === "error" || result.stopReason === "aborted";
+						!isSuccessfulResult(result);
 					if (isError) {
 						const errorMsg =
 							result.errorMessage || result.stderr || getFinalOutput(result.messages) || "(no output)";
@@ -2632,7 +2640,7 @@ export default function (pi: ExtensionAPI) {
 						);
 
 						// Team mode: save named output
-						if (teamName && result.exitCode === 0) {
+						if (teamName && isSuccessfulResult(result)) {
 							const output = getFinalOutput(result.messages);
 							if (output) {
 								saveOutput(teamName, outputName, output);
@@ -2657,13 +2665,13 @@ export default function (pi: ExtensionAPI) {
 					}
 				});
 
-				const successCount = results.filter((r) => r.exitCode === 0).length;
+				const successCount = results.filter((r) => isSuccessfulResult(r)).length;
 				const summaries = results.map((r) => {
 					const output = getFinalOutput(r.messages);
-					const failed = r.exitCode !== 0;
+					const failed = !isSuccessfulResult(r);
 					const fallback = failed ? (r.stderr ?? "").slice(0, 200) : "";
 					const preview = output.slice(0, 100) + (output.length > 100 ? "..." : "");
-					return `[${r.agent}] ${r.exitCode === 0 ? "completed" : "failed"}: ${preview || fallback || "(no output)"}`;
+					return `[${r.agent}] ${isSuccessfulResult(r) ? "completed" : "failed"}: ${preview || fallback || "(no output)"}`;
 				});
 				return {
 					content: [
@@ -2775,7 +2783,7 @@ export default function (pi: ExtensionAPI) {
 				);
 
 				// Team mode: save named output
-				if (teamName && result.exitCode === 0) {
+				if (teamName && isSuccessfulResult(result)) {
 					const output = getFinalOutput(result.messages);
 					if (output) {
 						saveOutput(teamName, outputName, output);
@@ -2783,7 +2791,7 @@ export default function (pi: ExtensionAPI) {
 					}
 				}
 
-				const isError = result.exitCode !== 0 || result.stopReason === "error" || result.stopReason === "aborted";
+				const isError = !isSuccessfulResult(result);
 
 				if (isError) {
 					const errorMsg =
@@ -2882,7 +2890,7 @@ export default function (pi: ExtensionAPI) {
 				const resultText = result.content[0]?.type === "text" ? result.content[0].text : "";
 				const isBackground = resultText.startsWith("Background agent started") || resultText.startsWith("Background agent queued");
 				const isRunning = !isBackground && r.exitCode === -1;
-				const isError = !isBackground && !isRunning && (r.exitCode !== 0 || r.stopReason === "error" || r.stopReason === "aborted");
+				const isError = !isBackground && !isRunning && (!isSuccessfulResult(r));
 				const icon = isBackground ? "🏃" : isRunning ? theme.fg("warning", "⏳") : isError ? theme.fg("error", "✗") : theme.fg("success", "✓");
 				const displayItems = getDisplayItems(r.messages);
 				const finalOutput = getFinalOutput(r.messages);
@@ -2973,7 +2981,7 @@ export default function (pi: ExtensionAPI) {
 			};
 
 			if (details.mode === "chain") {
-				const successCount = details.results.filter((r) => r.exitCode === 0).length;
+				const successCount = details.results.filter((r) => isSuccessfulResult(r)).length;
 				const icon = successCount === details.results.length ? theme.fg("success", "✓") : theme.fg("error", "✗");
 
 				if (expanded) {
@@ -2990,7 +2998,7 @@ export default function (pi: ExtensionAPI) {
 					);
 
 					for (const r of details.results) {
-						const rIcon = r.exitCode === -1 ? theme.fg("warning", "⏳") : r.exitCode === 0 ? theme.fg("success", "✓") : theme.fg("error", "✗");
+						const rIcon = r.exitCode === -1 ? theme.fg("warning", "⏳") : isSuccessfulResult(r) ? theme.fg("success", "✓") : theme.fg("error", "✗");
 						const displayItems = getDisplayItems(r.messages);
 						const finalOutput = getFinalOutput(r.messages);
 
@@ -3052,7 +3060,7 @@ export default function (pi: ExtensionAPI) {
 					theme.fg("toolTitle", theme.bold("chain ")) +
 					theme.fg("accent", `${successCount}/${details.results.length} steps`);
 				for (const r of details.results) {
-					const rIcon = r.exitCode === -1 ? theme.fg("warning", "⏳") : r.exitCode === 0 ? theme.fg("success", "✓") : theme.fg("error", "✗");
+					const rIcon = r.exitCode === -1 ? theme.fg("warning", "⏳") : isSuccessfulResult(r) ? theme.fg("success", "✓") : theme.fg("error", "✗");
 					const displayItems = getDisplayItems(r.messages);
 					text += `\n\n${theme.fg("muted", `─── Step ${r.step}: `)}${theme.fg("accent", r.agent)} ${rIcon}`;
 					if (displayItems.length === 0) text += `\n${theme.fg("muted", "(no output)")}`;
@@ -3068,8 +3076,8 @@ export default function (pi: ExtensionAPI) {
 
 			if (details.mode === "parallel") {
 				const running = details.results.filter((r) => r.exitCode === -1).length;
-				const successCount = details.results.filter((r) => r.exitCode === 0).length;
-				const failCount = details.results.filter((r) => r.exitCode > 0).length;
+				const successCount = details.results.filter((r) => isSuccessfulResult(r)).length;
+				const failCount = details.results.filter((r) => r.exitCode !== -1 && !isSuccessfulResult(r)).length;
 				const isRunning = running > 0;
 				const icon = isRunning
 					? theme.fg("warning", "⏳")
@@ -3091,7 +3099,7 @@ export default function (pi: ExtensionAPI) {
 					);
 
 					for (const r of details.results) {
-						const rIcon = r.exitCode === 0 ? theme.fg("success", "✓") : theme.fg("error", "✗");
+						const rIcon = isSuccessfulResult(r) ? theme.fg("success", "✓") : theme.fg("error", "✗");
 						const displayItems = getDisplayItems(r.messages);
 						const finalOutput = getFinalOutput(r.messages);
 
@@ -3148,7 +3156,7 @@ export default function (pi: ExtensionAPI) {
 					const rIcon =
 						r.exitCode === -1
 							? theme.fg("warning", "⏳")
-							: r.exitCode === 0
+							: isSuccessfulResult(r)
 								? theme.fg("success", "✓")
 								: theme.fg("error", "✗");
 					const displayItems = getDisplayItems(r.messages);
