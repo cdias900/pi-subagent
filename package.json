@@ -1,6 +1,6 @@
 {
   "name": "pi-subagent",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "description": "Multi-agent orchestration for PI — spawn specialized agents, coordinate teams, share context",
   "keywords": [
     "pi-package",
@@ -17,14 +17,20 @@
   "scripts": {
     "test": "vitest run",
     "test:host": "vitest run --config vitest.host.config.ts",
+    "bench:sdk": "PI_SUBAGENT_BENCH=1 vitest run sdk-runner.test.ts -t 'benchmarks identical offline workloads' --disableConsoleIntercept",
     "typecheck": "tsc --noEmit"
   },
   "peerDependencies": {
+    "@earendil-works/pi-agent-core": "*",
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": ">=0.83.0",
+    "@earendil-works/pi-tui": "*",
     "@mariozechner/pi-agent-core": "*",
     "@mariozechner/pi-ai": "*",
     "@mariozechner/pi-coding-agent": "*",
     "@mariozechner/pi-tui": "*",
-    "@sinclair/typebox": "*"
+    "@sinclair/typebox": "*",
+    "typebox": "*"
   },
   "pi": {
     "extensions": [
@@ -32,11 +38,17 @@
     ]
   },
   "dependencies": {
+    "@modelcontextprotocol/sdk": "1.27.1",
     "ajv": "^8.20.0",
-    "ajv-formats": "^3.0.1"
+    "ajv-formats": "^3.0.1",
+    "jiti": "2.7.0",
+    "yaml": "^2.8.2"
   },
   "devDependencies": {
-    "@earendil-works/pi-ai": "0.82.1",
+    "@earendil-works/pi-agent-core": "0.83.0",
+    "@earendil-works/pi-ai": "0.83.0",
+    "@earendil-works/pi-coding-agent": "0.83.0",
+    "@earendil-works/pi-tui": "0.83.0",
     "typescript": "^5.9.3",
     "vitest": "^4.1.10"
   }

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildModelArgs } from "./index.js";
+import { buildModelArgs } from "./test/legacy-cli-options.js";
 
 describe("buildModelArgs", () => {
 	it("returns no flags when neither model nor thinking level is resolved", () => {

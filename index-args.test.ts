@@ -1,7 +1,7 @@
 /**
  * Tests for the foreground/background spawn-isolation arg helpers.
  *
- * These tests exercise the pure, exported helpers from index.ts:
+ * These tests retain the historical CLI contract as comparison fixtures:
  *   - buildModelArgs
  *   - buildForegroundToolArgs
  *   - buildBackgroundToolArgs
@@ -24,7 +24,7 @@ import {
 	buildBackgroundToolArgs,
 	buildSystemPromptArgs,
 	buildIsolationArgs,
-} from "./index.js";
+} from "./test/legacy-cli-options.js";
 import { loadAgentsFromDir, type AgentConfig } from "./agents.js";
 
 const BUNDLED_AGENTS_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), "agents");
@@ -43,6 +43,12 @@ const BUNDLED = loadBundledAgents();
 
 // Fixed placeholders for dynamic values so snapshots are deterministic.
 const PROMPT_PATH = "/tmp/PROMPT.md";
+const ROLE_PROMPT_ARGS = [
+	"-e",
+	path.join(path.dirname(fileURLToPath(import.meta.url)), "child-system-prompt.ts"),
+	"--subagent-role-prompt",
+	PROMPT_PATH,
+];
 const TASK_PROMPT = "do the thing";
 const MODEL = "claude-sonnet-4";
 
@@ -117,16 +123,16 @@ describe("buildBackgroundToolArgs", () => {
 // ── System prompt + isolation args ─────────────────────────────────
 
 describe("buildSystemPromptArgs", () => {
-	it("default (undefined mode) => --append-system-prompt, no isolation flags", () => {
+	it("default (undefined mode) => child role extension, no isolation flags", () => {
 		expect(
 			buildSystemPromptArgs({ systemPromptMode: undefined, promptFilePath: PROMPT_PATH }),
-		).toEqual(["--append-system-prompt", PROMPT_PATH]);
+		).toEqual(ROLE_PROMPT_ARGS);
 	});
 
-	it("append mode => --append-system-prompt, no isolation flags", () => {
+	it("append mode => child role extension, no isolation flags", () => {
 		expect(
 			buildSystemPromptArgs({ systemPromptMode: "append", promptFilePath: PROMPT_PATH }),
-		).toEqual(["--append-system-prompt", PROMPT_PATH]);
+		).toEqual(ROLE_PROMPT_ARGS);
 	});
 
 	it("replace mode => --system-prompt + auto --no-skills/--no-prompt-templates/--no-context-files", () => {
@@ -135,6 +141,8 @@ describe("buildSystemPromptArgs", () => {
 		).toEqual([
 			"--system-prompt",
 			PROMPT_PATH,
+			"--append-system-prompt",
+			"",
 			"--no-skills",
 			"--no-prompt-templates",
 			"--no-context-files",
@@ -153,6 +161,8 @@ describe("buildSystemPromptArgs", () => {
 		expect(result).toEqual([
 			"--system-prompt",
 			PROMPT_PATH,
+			"--append-system-prompt",
+			"",
 			"--no-skills",
 			"--no-prompt-templates",
 			"--no-context-files",
@@ -169,7 +179,7 @@ describe("buildSystemPromptArgs", () => {
 				noSkills: true,
 				promptFilePath: PROMPT_PATH,
 			}),
-		).toEqual(["--append-system-prompt", PROMPT_PATH, "--no-skills"]);
+		).toEqual([...ROLE_PROMPT_ARGS, "--no-skills"]);
 	});
 
 	it("append mode with noPromptTemplates: true => adds only --no-prompt-templates", () => {
@@ -179,7 +189,7 @@ describe("buildSystemPromptArgs", () => {
 				noPromptTemplates: true,
 				promptFilePath: PROMPT_PATH,
 			}),
-		).toEqual(["--append-system-prompt", PROMPT_PATH, "--no-prompt-templates"]);
+		).toEqual([...ROLE_PROMPT_ARGS, "--no-prompt-templates"]);
 	});
 
 	it("append mode with noContextFiles: true => adds only --no-context-files", () => {
@@ -189,7 +199,7 @@ describe("buildSystemPromptArgs", () => {
 				noContextFiles: true,
 				promptFilePath: PROMPT_PATH,
 			}),
-		).toEqual(["--append-system-prompt", PROMPT_PATH, "--no-context-files"]);
+		).toEqual([...ROLE_PROMPT_ARGS, "--no-context-files"]);
 	});
 
 	it("append mode with all three no* true => adds all three", () => {
@@ -202,8 +212,7 @@ describe("buildSystemPromptArgs", () => {
 				promptFilePath: PROMPT_PATH,
 			}),
 		).toEqual([
-			"--append-system-prompt",
-			PROMPT_PATH,
+			...ROLE_PROMPT_ARGS,
 			"--no-skills",
 			"--no-prompt-templates",
 			"--no-context-files",
@@ -219,13 +228,13 @@ describe("buildSystemPromptArgs", () => {
 				noContextFiles: false,
 				promptFilePath: PROMPT_PATH,
 			}),
-		).toEqual(["--append-system-prompt", PROMPT_PATH]);
+		).toEqual(ROLE_PROMPT_ARGS);
 	});
 
 	it("default mode with noSkills: true => adds --no-skills", () => {
 		expect(
 			buildSystemPromptArgs({ noSkills: true, promptFilePath: PROMPT_PATH }),
-		).toEqual(["--append-system-prompt", PROMPT_PATH, "--no-skills"]);
+		).toEqual([...ROLE_PROMPT_ARGS, "--no-skills"]);
 	});
 
 	it("partial no* flags: only true ones honored", () => {
@@ -236,7 +245,7 @@ describe("buildSystemPromptArgs", () => {
 				noContextFiles: false,
 				promptFilePath: PROMPT_PATH,
 			}),
-		).toEqual(["--append-system-prompt", PROMPT_PATH, "--no-prompt-templates"]);
+		).toEqual([...ROLE_PROMPT_ARGS, "--no-prompt-templates"]);
 	});
 });
 
@@ -299,7 +308,7 @@ describe("buildIsolationArgs", () => {
 			noPromptTemplates: true,
 			noContextFiles: true,
 		});
-		expect(all).not.toContain("--append-system-prompt");
+		expect(all).not.toContain("--subagent-role-prompt");
 		expect(all).not.toContain("--system-prompt");
 	});
 });
@@ -389,8 +398,7 @@ describe("bundled agent foreground snapshots", () => {
 			"--no-extensions",
 			"--tools",
 			"read,grep,find,ls,bash",
-			"--append-system-prompt",
-			PROMPT_PATH,
+			...ROLE_PROMPT_ARGS,
 			TASK_PROMPT,
 		]);
 	});
@@ -404,8 +412,7 @@ describe("bundled agent foreground snapshots", () => {
 			"--no-extensions",
 			"--tools",
 			"read,write,grep,find,ls",
-			"--append-system-prompt",
-			PROMPT_PATH,
+			...ROLE_PROMPT_ARGS,
 			TASK_PROMPT,
 		]);
 	});
@@ -419,8 +426,7 @@ describe("bundled agent foreground snapshots", () => {
 			"--no-extensions",
 			"--tools",
 			"read,grep,find,ls,bash",
-			"--append-system-prompt",
-			PROMPT_PATH,
+			...ROLE_PROMPT_ARGS,
 			TASK_PROMPT,
 		]);
 	});
@@ -432,16 +438,15 @@ describe("bundled agent foreground snapshots", () => {
 			"-p",
 			"--no-session",
 			"--no-extensions",
-			"--append-system-prompt",
-			PROMPT_PATH,
+			...ROLE_PROMPT_ARGS,
 			TASK_PROMPT,
 		]);
 	});
 
-	it("all bundled foreground args use --append-system-prompt (no replace/isolation flags)", () => {
+	it("all bundled foreground args use the child role extension (no replace/isolation flags)", () => {
 		for (const name of ["scout", "planner", "reviewer", "executor"]) {
 			const args = foregroundArgs(BUNDLED[name]);
-			expect(args).toContain("--append-system-prompt");
+			expect(args).toContain("--subagent-role-prompt");
 			expect(args).not.toContain("--system-prompt");
 			expect(args).not.toContain("--no-skills");
 			expect(args).not.toContain("--no-prompt-templates");
@@ -572,6 +577,8 @@ describe("empty-body foreground isolation", () => {
 			"--no-extensions",
 			"--system-prompt",
 			PROMPT_PATH,
+			"--append-system-prompt",
+			"",
 			"--no-skills",
 			"--no-prompt-templates",
 			"--no-context-files",
@@ -596,6 +603,8 @@ describe("empty-body foreground isolation", () => {
 			"--no-extensions",
 			"--system-prompt",
 			PROMPT_PATH,
+			"--append-system-prompt",
+			"",
 			"--no-skills",
 			"--no-prompt-templates",
 			"--no-context-files",
@@ -610,7 +619,7 @@ describe("empty-body foreground isolation", () => {
 		const args = foregroundArgs(
 			emptyBodyAgent({ noSkills: true, noPromptTemplates: true, noContextFiles: true }),
 		);
-		expect(args).not.toContain("--append-system-prompt");
+		expect(args).not.toContain("--subagent-role-prompt");
 		expect(args).not.toContain("--system-prompt");
 	});
 });
@@ -626,8 +635,7 @@ describe("bundled agent background snapshots", () => {
 			"<bg-signal-ext>",
 			"--tools",
 			"read,grep,find,ls,bash,__bg_signal",
-			"--append-system-prompt",
-			PROMPT_PATH,
+			...ROLE_PROMPT_ARGS,
 		]);
 	});
 
@@ -641,8 +649,7 @@ describe("bundled agent background snapshots", () => {
 			"<bg-signal-ext>",
 			"--tools",
 			"read,write,grep,find,ls,__bg_signal",
-			"--append-system-prompt",
-			PROMPT_PATH,
+			...ROLE_PROMPT_ARGS,
 		]);
 	});
 
@@ -656,8 +663,7 @@ describe("bundled agent background snapshots", () => {
 			"<bg-signal-ext>",
 			"--tools",
 			"read,grep,find,ls,bash,__bg_signal",
-			"--append-system-prompt",
-			PROMPT_PATH,
+			...ROLE_PROMPT_ARGS,
 		]);
 	});
 
@@ -669,8 +675,7 @@ describe("bundled agent background snapshots", () => {
 			"--no-extensions",
 			"-e",
 			"<bg-signal-ext>",
-			"--append-system-prompt",
-			PROMPT_PATH,
+			...ROLE_PROMPT_ARGS,
 		]);
 	});
 
@@ -682,10 +687,10 @@ describe("bundled agent background snapshots", () => {
 		}
 	});
 
-	it("all bundled background args use --append-system-prompt", () => {
+	it("all bundled background args use the child role extension", () => {
 		for (const name of ["scout", "planner", "reviewer", "executor"]) {
 			const args = backgroundArgs(BUNDLED[name]);
-			expect(args).toContain("--append-system-prompt");
+			expect(args).toContain("--subagent-role-prompt");
 			expect(args).not.toContain("--system-prompt");
 		}
 	});
@@ -750,7 +755,7 @@ describe("no unrelated arg drift", () => {
 			const fg = foregroundArgs(BUNDLED[name]);
 			const toolsIdx = fg.indexOf("--tools");
 			const baseEnd = fg.indexOf("--no-extensions");
-			const promptIdx = fg.indexOf("--append-system-prompt");
+			const promptIdx = fg.indexOf("--subagent-role-prompt");
 			expect(toolsIdx).toBeGreaterThan(baseEnd);
 			expect(toolsIdx).toBeLessThan(promptIdx);
 		}
@@ -774,7 +779,7 @@ describe("no unrelated arg drift", () => {
 		const modelIdx = args.indexOf("--model");
 		const thinkingIdx = args.indexOf("--thinking");
 		const toolsIdx = args.indexOf("--tools");
-		const systemPromptIdx = args.indexOf("--append-system-prompt");
+		const systemPromptIdx = args.indexOf("--subagent-role-prompt");
 		const taskPromptIdx = args.indexOf(TASK_PROMPT);
 
 		expect(extensionIdx).toBeLessThan(modelIdx);
@@ -793,7 +798,7 @@ describe("no unrelated arg drift", () => {
 		const modelIdx = args.indexOf("--model");
 		const thinkingIdx = args.indexOf("--thinking");
 		const toolsIdx = args.indexOf("--tools");
-		const promptIdx = args.indexOf("--append-system-prompt");
+		const promptIdx = args.indexOf("--subagent-role-prompt");
 
 		expect(extensionIdx).toBeLessThan(modelIdx);
 		expect(modelIdx).toBeLessThan(thinkingIdx);

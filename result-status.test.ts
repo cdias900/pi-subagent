@@ -41,7 +41,7 @@ describe("subagent terminal completion", () => {
 function backgroundFixture(stopReason: string, exitCode = 0): Parameters<typeof handleBgSignal>[0] {
 	return {
 		id: "fixture", agent: "fixture", task: "synthetic", prompt: "synthetic", promptKind: "task",
-		proc: null, status: "running", startTime: 0, cwd: "/tmp", spawnArgs: [],
+		status: "running", startTime: 0, cwd: "/tmp",
 		agentConfig: { name: "fixture", description: "synthetic", systemPrompt: "", source: "user", filePath: "/tmp/fixture.md" },
 		result: { agent: "fixture", agentSource: "user", task: "synthetic", exitCode, stopReason,
 			errorMessage: "historical error", messages: [], stderr: "", startTime: 0,

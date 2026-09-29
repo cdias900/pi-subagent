@@ -155,7 +155,9 @@ function captureExtensionRegistration(): void {
 		},
 	} as unknown as ExtensionAPI;
 
-	registerExtension(pi);
+	registerExtension(pi, {
+		settings: { allowInvocationModelOverrides: true },
+	});
 }
 
 function discoveryFor(agents: AgentConfig[]): AgentDiscoveryResult {

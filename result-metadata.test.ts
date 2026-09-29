@@ -138,6 +138,13 @@ describe("formatUsageStats resolved configuration", () => {
 		);
 	});
 
+	it("uses the SDK model's actual context window instead of the fallback table", () => {
+		const usage = { ...EMPTY_USAGE, contextTokens: 4096 };
+		expect(formatUsageStats(usage, "offline-test/mock", { contextWindow: 8192 }))
+			.toContain("50.0% (4.1k/8.2k)");
+		expect(formatUsageStats(usage, "offline-test/mock")).toContain("ctx:4.1k");
+	});
+
 	it("keeps aggregate no-model output unchanged", () => {
 		expect(
 			formatUsageStats(

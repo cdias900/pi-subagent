@@ -33,7 +33,14 @@ export function getTeamsDir(): string {
 	return TEAMS_DIR;
 }
 
+export function validateTeamPathName(name: string, kind = "Team name"): void {
+	if (typeof name !== "string" || name.length === 0 || name === "." || name === ".." || /[/\\\0]/.test(name) || path.isAbsolute(name)) {
+		throw new Error(`${kind} must be a non-empty filename, not a path`);
+	}
+}
+
 export function getTeamDir(teamName: string): string {
+	validateTeamPathName(teamName);
 	return path.join(TEAMS_DIR, teamName);
 }
 
@@ -76,12 +83,14 @@ export function loadSharedContext(teamName: string): string {
 }
 
 export function saveOutput(teamName: string, outputName: string, content: string): void {
+	validateTeamPathName(outputName, "Output name");
 	const dir = path.join(getTeamDir(teamName), "outputs");
 	fs.mkdirSync(dir, { recursive: true });
 	fs.writeFileSync(path.join(dir, `${outputName}.md`), content);
 }
 
 export function loadOutput(teamName: string, outputName: string): string | null {
+	validateTeamPathName(outputName, "Output name");
 	const filePath = path.join(getTeamDir(teamName), "outputs", `${outputName}.md`);
 	try {
 		return fs.readFileSync(filePath, "utf-8");
@@ -105,6 +114,7 @@ export function listOutputs(teamName: string): string[] {
 // ── Scoped MCP configs ─────────────────────────────────────────────────
 
 function scopedMcpConfigPath(teamName: string, saveAs: string): string {
+	validateTeamPathName(saveAs, "Scoped config name");
 	return path.join(getTeamDir(teamName), `.mcp-${saveAs}.json`);
 }
 

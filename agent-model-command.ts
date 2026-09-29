@@ -14,6 +14,10 @@ import {
 	Text,
 } from "@mariozechner/pi-tui";
 import type { AgentConfig } from "./agents.js";
+import type {
+	AgentModelFileChange,
+	AgentModelFileResult,
+} from "./agent-model-file.js";
 import {
 	type AgentModelOverride,
 	type ForceResetResult,
@@ -68,11 +72,10 @@ export interface AgentModelCommandDeps {
 		override: AgentModelOverride | undefined,
 	): void | Promise<void>;
 	loadGlobal(): LoadResult;
-	saveGlobal(
-		agent: string,
-		override: AgentModelOverride,
-	): void | Promise<void>;
-	resetGlobal(agent: string): void | Promise<void>;
+	persistAgentModel(
+		agent: AgentConfig,
+		change: AgentModelFileChange,
+	): AgentModelFileResult | Promise<AgentModelFileResult>;
 	forceResetGlobal(): ForceResetResult;
 	makePort(ctx: ExtensionCommandContext): ModelCatalogPort;
 	parentFor(ctx: ExtensionCommandContext): AgentModelOverride;
@@ -97,7 +100,7 @@ const USAGE = [
 const DEFAULT_MODEL_VALUE = "__default__";
 const DEFAULT_REASONING_LABEL = "Use agent default";
 const SESSION_SCOPE_LABEL = "Current Pi session";
-const GLOBAL_SCOPE_LABEL = "Global default";
+const GLOBAL_SCOPE_LABEL = "User agent file (global)";
 const SCOPE_CHOICES = [SESSION_SCOPE_LABEL, GLOBAL_SCOPE_LABEL] as const;
 
 type ExtensionMode = "tui" | "rpc" | "json" | "print";
@@ -156,7 +159,7 @@ export function buildModelItems(models: readonly Model<Api>[]): SelectItem[] {
 		{
 			value: DEFAULT_MODEL_VALUE,
 			label: DEFAULT_REASONING_LABEL,
-			description: "Clear this scope's override",
+			description: "Clear the selected scope's model setting",
 		},
 		...models.map((model) => {
 			const parts = [model.name];
@@ -306,7 +309,7 @@ function unknownAgentMessage(
 function directModeError(): string {
 	return (
 		"Direct /agent-model forms require a live TUI or RPC UI. " +
-		"In headless modes, pass model and thinkingLevel to the subagent tool instead."
+		"In headless modes, configure the user agent frontmatter or, when invocation overrides are enabled, pass model and thinkingLevel to the subagent tool instead."
 	);
 }
 
@@ -359,6 +362,7 @@ function successMessage(
 	agentName: string,
 	scope: AgentModelScope,
 	effective: ResolvedModelConfig,
+	savedPath?: string,
 ): string {
 	return [
 		`Agent "${agentName}" updated:`,
@@ -366,12 +370,12 @@ function successMessage(
 		`reasoning ${effective.thinkingLevel ?? "agent/model default"};`,
 		`source ${effective.source};`,
 		`scope ${scopeLabel(scope)} (${scope}).`,
+		...(savedPath === undefined ? [] : [`Saved ${savedPath}.`]),
 	].join(" ");
 }
 
-function effectiveConfigForChange(
+function effectiveConfigForSessionChange(
 	agent: AgentConfig,
-	scope: AgentModelScope,
 	override: AgentModelOverride | undefined,
 	ctx: ExtensionCommandContext,
 	deps: AgentModelCommandDeps,
@@ -379,30 +383,31 @@ function effectiveConfigForChange(
 	const session = deps.getSessionOverrides();
 	const globalLoad = deps.loadGlobal();
 
-	// Global-scope writes must merge into the existing file, so fail closed on a
-	// corrupt global config — the user should run /agent-model global reset --force.
-	if (scope === "global" && globalLoad.error !== undefined) {
-		throw new Error(globalLoad.error);
-	}
-
-	// Session-scope writes tolerate a corrupt global file: ignore its defaults
-	// and surface the problem as a non-fatal warning after the write succeeds.
+	// Session-scope writes tolerate a corrupt legacy global file: ignore its
+	// defaults and surface the problem as a non-fatal warning after the write.
 	const global = globalLoad.error !== undefined ? {} : globalLoad.config;
-	const nextSession =
-		scope === "session"
-			? withOverride(session, agent.name, override)
-			: session;
-	const nextGlobal =
-		scope === "global"
-			? withOverride(global, agent.name, override)
-			: global;
-
+	const nextSession = withOverride(session, agent.name, override);
 	const effective = deps.buildEffectiveConfig(agent, {
 		session: nextSession[agent.name],
-		global: nextGlobal[agent.name],
+		global: global[agent.name],
 		parent: deps.parentFor(ctx),
 	});
 	return { effective, globalError: globalLoad.error };
+}
+
+function legacyGlobalOverrideError(
+	agent: AgentConfig,
+	globalLoad: LoadResult,
+): string | undefined {
+	if (globalLoad.error !== undefined) return globalLoad.error;
+	if (!Object.prototype.hasOwnProperty.call(globalLoad.config, agent.name)) {
+		return undefined;
+	}
+	return [
+		`Agent "${agent.name}" still has a legacy override in ${globalLoad.path}.`,
+		"That override would mask the agent frontmatter.",
+		`Move or remove the "${agent.name}" entry from the JSON file, then retry /agent-model.`,
+	].join(" ");
 }
 
 async function persistChange(
@@ -412,31 +417,55 @@ async function persistChange(
 	ctx: ExtensionCommandContext,
 	deps: AgentModelCommandDeps,
 ): Promise<void> {
-	// Resolve every fallible config dependency before the single scoped write.
-	const { effective, globalError } = effectiveConfigForChange(
-		agent,
-		scope,
-		override,
-		ctx,
-		deps,
-	);
-
 	if (scope === "session") {
+		const { effective, globalError } = effectiveConfigForSessionChange(
+			agent,
+			override,
+			ctx,
+			deps,
+		);
 		await deps.setSessionOverride(agent.name, override);
-	} else if (override === undefined) {
-		await deps.resetGlobal(agent.name);
-	} else {
-		await deps.saveGlobal(agent.name, override);
+		ctx.ui.notify(successMessage(agent.name, scope, effective), "info");
+
+		if (globalError !== undefined) {
+			ctx.ui.notify(
+				`Warning: the legacy global subagent model config is unreadable (${globalError}). The session override was applied, but legacy defaults were ignored. Run \`/agent-model global reset --force\` to repair the legacy config.`,
+				"warning",
+			);
+		}
+		return;
 	}
 
-	ctx.ui.notify(successMessage(agent.name, scope, effective), "info");
-
-	if (scope === "session" && globalError !== undefined) {
-		ctx.ui.notify(
-			`Warning: the global subagent model config is unreadable (${globalError}). The session override was applied, but global defaults were ignored. Run \`/agent-model global reset --force\` to repair the global config.`,
-			"warning",
+	const globalLoad = deps.loadGlobal();
+	const legacyError = legacyGlobalOverrideError(agent, globalLoad);
+	if (legacyError !== undefined) throw new Error(legacyError);
+	if (agent.source !== "user") {
+		throw new Error(
+			`Agent "${agent.name}" is ${agent.source}-source. Global model changes edit an existing user agent file; create a user-owned copy first.`,
 		);
 	}
+	if (override !== undefined && override.model === undefined) {
+		throw new Error("Internal invariant violated: a global model change has no model");
+	}
+
+	const change: AgentModelFileChange = override === undefined
+		? { model: undefined }
+		: {
+				model: override.model!,
+				...(override.thinkingLevel === undefined
+					? {}
+					: { thinkingLevel: override.thinkingLevel }),
+			};
+	const saved = await deps.persistAgentModel(agent, change);
+	const session = deps.getSessionOverrides();
+	const effective = deps.buildEffectiveConfig(saved.config, {
+		session: session[agent.name],
+		parent: deps.parentFor(ctx),
+	});
+	ctx.ui.notify(
+		successMessage(agent.name, scope, effective, saved.path),
+		"info",
+	);
 }
 
 function formatEffectiveConfigRow(
@@ -667,7 +696,7 @@ async function handleGuided(
 	const global = globalLoad.error !== undefined ? {} : globalLoad.config;
 	if (globalLoad.error !== undefined) {
 		ctx.ui.notify(
-			`Warning: the global subagent model config is unreadable (${globalLoad.error}). Global defaults will be ignored for this selection. Run \`/agent-model global reset --force\` to repair the global config.`,
+			`Warning: the legacy global subagent model config is unreadable (${globalLoad.error}). Legacy defaults will be ignored for this selection. Run \`/agent-model global reset --force\` to repair the legacy config.`,
 			"warning",
 		);
 	}
@@ -783,7 +812,7 @@ export function registerAgentModelCommand(
 ): void {
 	pi.registerCommand("agent-model", {
 		description:
-			"Choose a subagent model and reasoning level for this session or globally",
+			"Choose a subagent model and reasoning level for this session or persist it in user-agent frontmatter",
 		handler: async (args, ctx) => {
 			const parsed = parseAgentModelArgs(args ?? "");
 			if (parsed.kind === "error") {
@@ -795,7 +824,7 @@ export function registerAgentModelCommand(
 				try {
 					const result = deps.forceResetGlobal();
 					const lines = [
-						"Global subagent model configuration reset.",
+						"Legacy global subagent model configuration reset.",
 						`Recovered: ${result.recoveredPath}`,
 					];
 					if (result.backupPath !== undefined) {

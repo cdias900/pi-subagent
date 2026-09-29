@@ -99,21 +99,11 @@ function extractCalls(source: string, callee: string): string[] {
 	}
 }
 
-const TASK_SCHEMA = between(INDEX_SRC, "const TaskItem", "const ChainItem");
-const CHAIN_SCHEMA = between(INDEX_SRC, "const ChainItem", "const AgentScopeSchema");
-const SUBAGENT_SCHEMA = between(INDEX_SRC, "const SubagentParams", "export default function");
 const SUBAGENT_EXECUTE = between(
 	INDEX_SRC,
 	"async execute(_toolCallId, params, signal, onUpdate, ctx)",
 	"\n\t\trenderCall(args, theme)",
 );
-
-function expectOptionalModelFields(schemaSource: string): void {
-	expect(schemaSource).toMatch(/\bmodel:\s*Type\.Optional\(Type\.String\(/);
-	expect(schemaSource).toMatch(
-		/\bthinkingLevel:\s*Type\.Optional\(SubagentThinkingLevelSchema\)/,
-	);
-}
 
 function expectOnePreflightBefore(
 	source: string,
@@ -133,11 +123,11 @@ function expectOnePreflightBefore(
 }
 
 describe("subagent model selection schemas", () => {
-	it("exposes model and the canonical thinking level on task, chain, and invocation schemas", () => {
+	it("keeps the canonical thinking-level enum used by configurable invocation schemas", () => {
 		const thinkingSchema = between(
 			INDEX_SRC,
 			"const SubagentThinkingLevelSchema",
-			"const TaskItem",
+			"function invocationModelOverrideProperties",
 		);
 		const enumValues = /StringEnum\(\s*\[([\s\S]*?)\]\s*as const/.exec(
 			thinkingSchema,
@@ -146,10 +136,6 @@ describe("subagent model selection schemas", () => {
 		expect(
 			[...enumValues!.matchAll(/["']([^"']+)["']/g)].map((match) => match[1]),
 		).toEqual(CANONICAL_THINKING_LEVELS);
-
-		for (const schema of [TASK_SCHEMA, CHAIN_SCHEMA, SUBAGENT_SCHEMA]) {
-			expectOptionalModelFields(schema);
-		}
 	});
 
 	it("keeps invocation-wide and per-item values in separate resolution layers", () => {
@@ -249,38 +235,27 @@ describe("foreground model resolution wiring", () => {
 	});
 });
 
-describe("resolved model spawn wiring", () => {
-	it("places foreground model flags after extensions and before tools and prompts", () => {
+describe("resolved model SDK wiring", () => {
+	it("constructs the child with its resolved model before prompting", () => {
 		const runBody = between(
 			INDEX_SRC,
 			"async function runSingleAgent(",
 			"// ── Background agent helpers",
 		);
-		const extensionIdx = runBody.lastIndexOf('args.push("-e"');
-		const modelIdx = runBody.indexOf("buildModelArgs(invocation.resolvedModel)");
-		const toolsIdx = runBody.indexOf("buildForegroundToolArgs");
-		const systemPromptIdx = runBody.indexOf("buildSystemPromptArgs");
-		const taskPromptIdx = runBody.indexOf("args.push(invocation.prompt)");
-
-		expect(extensionIdx).toBeGreaterThanOrEqual(0);
-		expect(extensionIdx).toBeLessThan(modelIdx);
-		expect(modelIdx).toBeLessThan(toolsIdx);
-		expect(toolsIdx).toBeLessThan(systemPromptIdx);
-		expect(systemPromptIdx).toBeLessThan(taskPromptIdx);
+		const modelIdx = runBody.indexOf("resolvedModel: invocation.resolvedModel");
+		const taskPromptIdx = runBody.indexOf("await child.prompt(invocation.prompt)");
+		expect(modelIdx).toBeGreaterThanOrEqual(0);
+		expect(modelIdx).toBeLessThan(taskPromptIdx);
 	});
 
-	it("initializes foreground result metadata from the suffix-free resolved model", () => {
+	it("keeps requested model provenance separate from the SDK's actual model", () => {
 		const runBody = between(
 			INDEX_SRC,
 			"async function runSingleAgent(",
 			"// ── Background agent helpers",
 		);
-		expect(runBody).toMatch(
-			/const resultModel = invocation\.resolvedModel\.model === undefined\s*\? agent\.model\s*:\s*invocation\.resolvedModel\.model;/,
-		);
-		expect(runBody).toContain(
-			"model: resultModel === undefined ? undefined : normalizeModelString(resultModel).base",
-		);
+		expect(runBody).toContain("buildResolvedModelMetadata(invocation.resolvedModel)");
+		expect(runBody).toContain("currentResult.model ||= child.session.model?.id");
 	});
 
 	it("removes raw frontmatter-model pushes from child spawn assembly", () => {
@@ -348,7 +323,7 @@ describe("eager model registry preflight wiring", () => {
 		);
 		const singleCall = expectOnePreflightBefore(
 			single,
-			"buildBgSpawnArgs(",
+			"launchBackgroundAgent(",
 			"runSingleAgent(",
 		);
 		expect(singleCall).toContain("[invocation]");
@@ -418,9 +393,16 @@ describe("agent model command wiring", () => {
 		expect(registration).toContain("updated");
 	});
 
-	it("does not edit agent Markdown to persist model selection", () => {
+	it("routes durable model selection through the frontmatter persistence helper", () => {
+		expect(AGENT_MODEL_COMMAND_SRC).toContain("persistAgentModel(");
 		expect(AGENT_MODEL_COMMAND_SRC).not.toMatch(
-			/writeFile|appendFile|renameSync|frontmatter|\.filePath/,
+			/writeFile|appendFile|renameSync/,
+		);
+		expect(INDEX_SRC).toMatch(
+			/import\s*\{\s*persistAgentModelFile\s*\}\s*from\s*["']\.\/agent-model-file\.js["']/,
+		);
+		expect(INDEX_SRC).toContain(
+			"persistAgentModel: persistAgentModelFile",
 		);
 	});
 });

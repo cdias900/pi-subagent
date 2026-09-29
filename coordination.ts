@@ -13,18 +13,17 @@
  */
 
 import * as fs from "node:fs";
-import * as os from "node:os";
 import * as path from "node:path";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import { StringEnum } from "@mariozechner/pi-ai";
 
-const TEAMS_DIR = path.join(os.homedir(), ".pi", "teams");
+import { getTeamDir } from "./team.js";
 
 // ── Helpers ────────────────────────────────────────────────────────────
 
 function teamDir(teamName: string): string {
-	return path.join(TEAMS_DIR, teamName);
+	return getTeamDir(teamName);
 }
 
 function tasksPath(teamName: string): string {
@@ -46,8 +45,9 @@ interface Task {
 }
 
 function readTasks(teamName: string): Task[] {
+	const filePath = tasksPath(teamName);
 	try {
-		return JSON.parse(fs.readFileSync(tasksPath(teamName), "utf-8"));
+		return JSON.parse(fs.readFileSync(filePath, "utf-8"));
 	} catch {
 		return [];
 	}

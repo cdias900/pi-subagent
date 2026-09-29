@@ -5,6 +5,10 @@ import type {
 } from "@mariozechner/pi-coding-agent";
 import { describe, expect, it, vi } from "vitest";
 import type { AgentConfig } from "./agents.js";
+import type {
+	AgentModelFileChange,
+	AgentModelFileResult,
+} from "./agent-model-file.js";
 import {
 	buildModelItems,
 	filterModelItems,
@@ -18,6 +22,7 @@ import type {
 	ForceResetResult,
 	SubagentModelConfig,
 } from "./model-config.js";
+import { normalizeModelString } from "./model-normalize.js";
 import {
 	getSupportedThinkingLevelsCompat,
 	resolveModelLayers,
@@ -32,7 +37,7 @@ function fakeAgent(name: string, model?: string): AgentConfig {
 		description: `${name} description`,
 		model,
 		systemPrompt: `${name} prompt`,
-		source: "bundled",
+		source: "user",
 		filePath: `/agents/${name}.md`,
 	};
 }
@@ -120,14 +125,20 @@ function makeHarness(options: HarnessOptions = {}) {
 			session = replaceOverride(session, agent, override);
 		},
 	);
-	const saveGlobal = vi.fn(
-		(agent: string, override: AgentModelOverride) => {
-			global = replaceOverride(global, agent, override);
+	const persistAgentModel = vi.fn(
+		(agent: AgentConfig, change: AgentModelFileChange): AgentModelFileResult => {
+			const model = change.model === undefined
+				? undefined
+				: change.thinkingLevel === undefined
+					? normalizeModelString(change.model).base
+					: `${normalizeModelString(change.model).base}:${change.thinkingLevel}`;
+			return {
+				config: { ...agent, model },
+				path: agent.filePath,
+				changed: model !== agent.model,
+			};
 		},
 	);
-	const resetGlobal = vi.fn((agent: string) => {
-		global = replaceOverride(global, agent, undefined);
-	});
 	const forceResetGlobal = vi.fn((): ForceResetResult => ({
 		backupPath: "/config/subagent-models.json.corrupt-2025-01-01T00-00-00-000Z",
 		recoveredPath: "/config/subagent-models.json",
@@ -141,8 +152,7 @@ function makeHarness(options: HarnessOptions = {}) {
 			config: global,
 			path: "/config/subagent-models.json",
 		})),
-		saveGlobal,
-		resetGlobal,
+		persistAgentModel,
 		forceResetGlobal,
 		makePort: vi.fn(() => port),
 		parentFor: vi.fn((): AgentModelOverride => ({
@@ -192,9 +202,8 @@ function makeHarness(options: HarnessOptions = {}) {
 		handler: handler!,
 		models,
 		port,
-		resetGlobal,
+		persistAgentModel,
 		forceResetGlobal,
-		saveGlobal,
 		setSessionOverride,
 		getGlobal: () => global,
 		getSession: () => session,
@@ -235,8 +244,7 @@ function makeContext(options: {
 
 function expectNoWrites(harness: ReturnType<typeof makeHarness>): void {
 	expect(harness.setSessionOverride).not.toHaveBeenCalled();
-	expect(harness.saveGlobal).not.toHaveBeenCalled();
-	expect(harness.resetGlobal).not.toHaveBeenCalled();
+	expect(harness.persistAgentModel).not.toHaveBeenCalled();
 }
 
 describe("parseAgentModelArgs", () => {
@@ -348,40 +356,82 @@ describe("registerAgentModelCommand direct forms", () => {
 			model: "provider/reasoner",
 			thinkingLevel: "max",
 		});
-		expect(harness.saveGlobal).not.toHaveBeenCalled();
-		expect(harness.resetGlobal).not.toHaveBeenCalled();
+		expect(harness.persistAgentModel).not.toHaveBeenCalled();
 		expect(notify).toHaveBeenCalledWith(
 			expect.stringMatching(/scout[\s\S]*provider\/reasoner[\s\S]*max[\s\S]*session/i),
 			"info",
 		);
 	});
 
-	it("sets only the global override", async () => {
+	it("persists a global selection in the user agent frontmatter", async () => {
 		const harness = makeHarness();
 		const { ctx, notify } = makeContext({ mode: "rpc" });
 
 		await harness.handler("global scout provider/reasoner high", ctx);
 
-		expect(harness.saveGlobal).toHaveBeenCalledOnce();
-		expect(harness.saveGlobal).toHaveBeenCalledWith("scout", {
-			model: "provider/reasoner",
-			thinkingLevel: "high",
-		});
+		expect(harness.persistAgentModel).toHaveBeenCalledOnce();
+		expect(harness.persistAgentModel).toHaveBeenCalledWith(
+			harness.agents[0],
+			{
+				model: "provider/reasoner",
+				thinkingLevel: "high",
+			},
+		);
 		expect(harness.setSessionOverride).not.toHaveBeenCalled();
-		expect(harness.resetGlobal).not.toHaveBeenCalled();
 		expect(notify).toHaveBeenCalledWith(
-			expect.stringMatching(/scout[\s\S]*provider\/reasoner[\s\S]*high[\s\S]*global/i),
+			expect.stringMatching(/scout[\s\S]*provider\/reasoner[\s\S]*high[\s\S]*frontmatter[\s\S]*global[\s\S]*\/agents\/scout\.md/i),
 			"info",
 		);
 	});
 
+	it("rejects a durable change for a bundled agent", async () => {
+		const bundled = { ...fakeAgent("scout"), source: "bundled" as const };
+		const harness = makeHarness({ agents: [bundled] });
+		const { ctx, notify } = makeContext({ mode: "tui" });
+
+		await harness.handler("global scout provider/reasoner high", ctx);
+
+		expectNoWrites(harness);
+		expect(notify).toHaveBeenCalledWith(
+			expect.stringMatching(/bundled-source[\s\S]*user-owned copy/i),
+			"error",
+		);
+	});
+
+	it("rejects a frontmatter change while a legacy JSON entry would mask it", async () => {
+		const harness = makeHarness({
+			global: { scout: { model: "provider/plain", thinkingLevel: "off" } },
+		});
+		const { ctx, notify } = makeContext({ mode: "rpc" });
+
+		await harness.handler("global scout provider/reasoner high", ctx);
+
+		expectNoWrites(harness);
+		expect(notify).toHaveBeenCalledWith(
+			expect.stringMatching(/legacy override[\s\S]*subagent-models\.json[\s\S]*mask[\s\S]*remove/i),
+			"error",
+		);
+	});
+
+	it("allows a frontmatter change when only another agent has a legacy entry", async () => {
+		const harness = makeHarness({
+			global: { executor: { model: "provider/plain" } },
+		});
+		const { ctx } = makeContext({ mode: "rpc" });
+
+		await harness.handler("global scout provider/reasoner high", ctx);
+
+		expect(harness.persistAgentModel).toHaveBeenCalledOnce();
+	});
+
 	it.each([
 		["session", "setSessionOverride"],
-		["global", "resetGlobal"],
+		["global", "persistAgentModel"],
 	] as const)("resets only the %s scope", async (scope, expectedWrite) => {
+		const scout = fakeAgent("scout", "provider/reasoner:high");
 		const harness = makeHarness({
+			agents: [scout, fakeAgent("executor")],
 			session: { scout: { model: "provider/reasoner" } },
-			global: { scout: { model: "provider/reasoner" } },
 		});
 		const { ctx } = makeContext({ mode: "tui" });
 
@@ -392,12 +442,13 @@ describe("registerAgentModelCommand direct forms", () => {
 				"scout",
 				undefined,
 			);
-			expect(harness.resetGlobal).not.toHaveBeenCalled();
+			expect(harness.persistAgentModel).not.toHaveBeenCalled();
 		} else {
-			expect(harness.resetGlobal).toHaveBeenCalledWith("scout");
+			expect(harness.persistAgentModel).toHaveBeenCalledWith(scout, {
+				model: undefined,
+			});
 			expect(harness.setSessionOverride).not.toHaveBeenCalled();
 		}
-		expect(harness.saveGlobal).not.toHaveBeenCalled();
 	});
 
 	it("force-resets the entire global config and reports the backup and recovered paths", async () => {
@@ -408,10 +459,9 @@ describe("registerAgentModelCommand direct forms", () => {
 
 		expect(harness.forceResetGlobal).toHaveBeenCalledOnce();
 		expect(harness.setSessionOverride).not.toHaveBeenCalled();
-		expect(harness.saveGlobal).not.toHaveBeenCalled();
-		expect(harness.resetGlobal).not.toHaveBeenCalled();
+		expect(harness.persistAgentModel).not.toHaveBeenCalled();
 		expect(notify).toHaveBeenCalledWith(
-			expect.stringMatching(/Global subagent model configuration reset[\s\S]*Recovered:[\s\S]*\/config\/subagent-models\.json[\s\S]*Backup of corrupt file:[\s\S]*\.corrupt-/),
+			expect.stringMatching(/Legacy global subagent model configuration reset[\s\S]*Recovered:[\s\S]*\/config\/subagent-models\.json[\s\S]*Backup of corrupt file:[\s\S]*\.corrupt-/),
 			"info",
 		);
 	});
@@ -424,7 +474,7 @@ describe("registerAgentModelCommand direct forms", () => {
 
 		expect(harness.forceResetGlobal).toHaveBeenCalledOnce();
 		expect(notify).toHaveBeenCalledWith(
-			expect.stringContaining("Global subagent model configuration reset"),
+			expect.stringContaining("Legacy global subagent model configuration reset"),
 			"info",
 		);
 	});
@@ -515,8 +565,7 @@ describe("registerAgentModelCommand direct forms", () => {
 			model: "provider/reasoner",
 			thinkingLevel: "high",
 		});
-		expect(harness.saveGlobal).not.toHaveBeenCalled();
-		expect(harness.resetGlobal).not.toHaveBeenCalled();
+		expect(harness.persistAgentModel).not.toHaveBeenCalled();
 		// The success notification is still emitted.
 		expect(notify).toHaveBeenCalledWith(
 			expect.stringMatching(/scout[\s\S]*provider\/reasoner[\s\S]*high[\s\S]*session/i),
@@ -551,9 +600,9 @@ describe("registerAgentModelCommand direct forms", () => {
 		);
 	});
 
-	it("catches persistence errors without writing the other scope", async () => {
+	it("catches frontmatter persistence errors without writing the session scope", async () => {
 		const harness = makeHarness();
-		harness.saveGlobal.mockImplementation(() => {
+		harness.persistAgentModel.mockImplementation(() => {
 			throw new Error("disk is read-only");
 		});
 		const { ctx, notify } = makeContext({ mode: "rpc" });
@@ -562,7 +611,6 @@ describe("registerAgentModelCommand direct forms", () => {
 
 		expect(harness.getGlobal()).toEqual({});
 		expect(harness.setSessionOverride).not.toHaveBeenCalled();
-		expect(harness.resetGlobal).not.toHaveBeenCalled();
 		expect(notify).toHaveBeenCalledWith(
 			expect.stringContaining("disk is read-only"),
 			"error",
@@ -622,8 +670,7 @@ describe("registerAgentModelCommand guided flow", () => {
 			model: "provider/reasoner",
 			thinkingLevel: "high",
 		});
-		expect(harness.saveGlobal).not.toHaveBeenCalled();
-		expect(harness.resetGlobal).not.toHaveBeenCalled();
+		expect(harness.persistAgentModel).not.toHaveBeenCalled();
 		expect(harness.isAvailable).toHaveBeenCalledOnce();
 		expect(harness.isAvailable).toHaveBeenCalledWith(model);
 		expect(notify).toHaveBeenCalledOnce();
@@ -633,27 +680,27 @@ describe("registerAgentModelCommand guided flow", () => {
 		);
 	});
 
-	it("saves agent-default reasoning without a thinking level to the selected scope", async () => {
+	it("persists model-default reasoning without a thinking suffix in frontmatter", async () => {
 		const model = fakeModel("provider", "reasoner");
 		const harness = makeHarness({ models: [model], availableModels: [model] });
 		const { ctx } = makeContext({
 			mode: "tui",
 			models: [model],
 			customResults: ["provider/reasoner"],
-			selectResults: ["Use agent default", "Global default"],
+			selectResults: ["Use agent default", "User agent file (global)"],
 		});
 
 		await harness.handler("scout", ctx);
 
-		expect(harness.saveGlobal).toHaveBeenCalledOnce();
-		expect(harness.saveGlobal).toHaveBeenCalledWith("scout", {
-			model: "provider/reasoner",
-		});
-		const savedOverride = harness.saveGlobal.mock.calls[0]?.[1];
-		expect(savedOverride).toStrictEqual({ model: "provider/reasoner" });
-		expect(savedOverride).not.toHaveProperty("thinkingLevel");
+		expect(harness.persistAgentModel).toHaveBeenCalledOnce();
+		expect(harness.persistAgentModel).toHaveBeenCalledWith(
+			harness.agents[0],
+			{ model: "provider/reasoner" },
+		);
+		const savedChange = harness.persistAgentModel.mock.calls[0]?.[1];
+		expect(savedChange).toStrictEqual({ model: "provider/reasoner" });
+		expect(savedChange).not.toHaveProperty("thinkingLevel");
 		expect(harness.setSessionOverride).not.toHaveBeenCalled();
-		expect(harness.resetGlobal).not.toHaveBeenCalled();
 	});
 
 	it("revalidates guided availability before saving the selected scope", async () => {
@@ -778,24 +825,26 @@ describe("registerAgentModelCommand guided flow", () => {
 		expect(select).toHaveBeenCalledOnce();
 	});
 
-	it("skips reasoning and clears only the selected scope for agent default", async () => {
+	it("skips reasoning and removes the frontmatter model for the global default", async () => {
+		const scout = fakeAgent("scout", "provider/reasoner:high");
 		const harness = makeHarness({
+			agents: [scout, fakeAgent("executor")],
 			session: { scout: { model: "provider/reasoner" } },
-			global: { scout: { model: "provider/reasoner" } },
 		});
 		const { ctx, select } = makeContext({
 			mode: "tui",
 			models: harness.availableModels,
 			customResults: ["__default__"],
-			selectResults: ["Global default"],
+			selectResults: ["User agent file (global)"],
 		});
 
 		await harness.handler("scout", ctx);
 
 		expect(select).toHaveBeenCalledOnce();
-		expect(harness.resetGlobal).toHaveBeenCalledWith("scout");
+		expect(harness.persistAgentModel).toHaveBeenCalledWith(scout, {
+			model: undefined,
+		});
 		expect(harness.setSessionOverride).not.toHaveBeenCalled();
-		expect(harness.saveGlobal).not.toHaveBeenCalled();
 	});
 });
 
@@ -843,7 +892,7 @@ describe("buildModelItems", () => {
 		expect(items[0]).toEqual({
 			value: "__default__",
 			label: "Use agent default",
-			description: "Clear this scope's override",
+			description: "Clear the selected scope's model setting",
 		});
 		expect(items[1]?.value).toBe("provider/reasoner");
 	});

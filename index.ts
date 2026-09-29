@@ -1,18 +1,16 @@
 /**
  * Subagent Tool - Delegate tasks to specialized agents
  *
- * Spawns a separate `pi` process for each subagent invocation,
- * giving it an isolated context window.
+ * Runs each subagent in an in-process Pi SDK session with its own context.
  *
  * Supports three modes:
  *   - Single: { agent: "name", task: "..." }
  *   - Parallel: { tasks: [{ agent: "name", task: "..." }, ...] }
  *   - Chain: { chain: [{ agent: "name", task: "... {previous} ..." }, ...] }
  *
- * Uses JSON mode to capture structured output from subagents.
+ * Uses typed SDK session events for results and lifecycle control.
  */
 
-import { type ChildProcess, spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -29,8 +27,11 @@ import {
 import { Container, Markdown, Spacer, Text } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
 import { type AgentConfig, type AgentDiscoveryResult, type AgentScope, discoverAgents } from "./agents.js";
-import { hasTerminalFailure, isSuccessfulResult, processExitCode } from "./result-status.js";
+import { hasTerminalFailure, isSuccessfulResult } from "./result-status.js";
 import { registerAgentModelCommand } from "./agent-model-command.js";
+import { persistAgentModelFile } from "./agent-model-file.js";
+import { createSdkChild, type SdkChild } from "./sdk-runner.js";
+import { loadScopedMcpServers } from "./sdk-mcp.js";
 import { AgentsPanel, type PanelAgent, type TranscriptEntry } from "./agents-panel.js";
 import { registerCoordinationTools } from "./coordination.js";
 import {
@@ -44,11 +45,14 @@ import {
 	displayInputSummary,
 } from "./invocation.js";
 import {
+	assertInvocationModelOverridesAllowed,
+	loadSubagentSettings,
+	type SubagentSettings,
+} from "./invocation-policy.js";
+import {
 	formatGlobalConfigDispatchError,
 	forceResetGlobalConfig,
 	loadGlobalConfig,
-	resetGlobalOverride,
-	saveGlobalOverride,
 	type AgentModelOverride,
 	type SubagentModelConfig,
 } from "./model-config.js";
@@ -79,10 +83,8 @@ import {
 	listOutputs,
 	listTeams,
 	loadSharedContext,
-	removeScopedMcpConfig,
 	saveOutput,
 	teamExists,
-	writeScopedMcpConfig,
 } from "./team.js";
 
 /**
@@ -100,7 +102,7 @@ function buildExtensionMap(agentDir: string): Map<string, string> {
 			if (entry.isFile() && entry.name.endsWith(".ts")) {
 				const name = entry.name.replace(/\.ts$/, "");
 				extMap.set(name, path.join(globalExtDir, entry.name));
-			} else if (entry.isDirectory()) {
+			} else if (entry.isDirectory() || entry.isSymbolicLink()) {
 				const idx = path.join(globalExtDir, entry.name, "index.ts");
 				if (fs.existsSync(idx)) {
 					extMap.set(entry.name, idx);
@@ -154,7 +156,8 @@ function resolveExtensionPaths(agentDir: string, requested: string[]): string[] 
 	const resolved: string[] = [];
 	for (const name of requested) {
 		const extPath = extMap.get(name);
-		if (extPath) resolved.push(extPath);
+		if (!extPath) throw new Error(`Requested child extension "${name}" is not installed`);
+		resolved.push(extPath);
 	}
 	return resolved;
 }
@@ -200,8 +203,8 @@ function readPositiveIntEnv(name: string, fallback: number): number {
 /**
  * The single concurrency limit for this extension, covering both the number
  * of agents in one parallel `subagent` call and how many background agents
- * run at once. Each agent is a full `pi` child process (~150MB) making its
- * own LLM calls, so raising this costs memory and pushes harder against
+ * run at once. Each agent has its own SDK session and LLM calls,
+ * so raising this costs memory and pushes harder against
  * provider rate limits. Override with PI_SUBAGENT_MAX_AGENTS.
  */
 const MAX_PARALLEL_AGENTS = readPositiveIntEnv("PI_SUBAGENT_MAX_AGENTS", 50);
@@ -266,6 +269,7 @@ export function formatUsageStats(
 	opts?: {
 		provider?: string;
 		elapsedMs?: number;
+		contextWindow?: number;
 		thinkingLevel?: SubagentThinkingLevel;
 		source?: ModelSource;
 	},
@@ -283,7 +287,7 @@ export function formatUsageStats(
 		if (totalTokens > 0) line1Parts.push(`${formatTokens(totalTokens)} tokens`);
 		if (usage.cost) line1Parts.push(`$${usage.cost.toFixed(3)}`);
 		if (usage.contextTokens && usage.contextTokens > 0) {
-			const ctxWindow = getContextWindow(parsed.modelId);
+			const ctxWindow = opts?.contextWindow ?? getContextWindow(parsed.modelId);
 			if (ctxWindow) {
 				const pct = ((usage.contextTokens / ctxWindow) * 100).toFixed(1);
 				line1Parts.push(`${pct}% (${formatTokens(usage.contextTokens)}/${formatTokens(ctxWindow)})`);
@@ -397,6 +401,7 @@ interface UsageStats {
 }
 
 interface SingleResult {
+	backend?: "sdk";
 	agent: string;
 	agentSource: "user" | "project" | "bundled" | "unknown";
 	task: string;
@@ -406,6 +411,7 @@ interface SingleResult {
 	usage: UsageStats;
 	model?: string;
 	provider?: string;
+	contextWindow?: number;
 	resolvedModel?: string;
 	resolvedThinkingLevel?: SubagentThinkingLevel;
 	configSource?: ModelSource;
@@ -450,18 +456,22 @@ interface BackgroundAgent {
 	prompt: string;
 	promptKind: "task" | "input";
 	input?: unknown;
-	proc: ChildProcess | null;
+	sdk?: SdkChild;
+	setupController?: AbortController;
+	sdkReady?: Promise<SdkChild>;
+	sdkCleanup?: Promise<void>;
+	sdkCleanupStarted?: boolean;
+	sdkRunId?: number;
+	interrupting?: boolean;
+	resolvedModel?: ResolvedModelConfig;
+	currentTool?: string;
+	lastEventAt?: number;
 	result: SingleResult;
 	status: "queued" | "running" | "waiting" | "done" | "error" | "aborted";
 	startTime: number;
 	endTime?: number;
 	cwd: string;
 	agentConfig: AgentConfig;
-	spawnArgs: string[];
-	spawnEnv?: Record<string, string | undefined>;
-	tmpPromptDir?: string;
-	tmpPromptPath?: string;
-	mcpCleanupName?: string;
 	teamName?: string;
 	saveAs?: string;
 	extensions?: string[];
@@ -473,7 +483,6 @@ interface ForegroundAgentHandle {
 	id: string;
 	agentName: string;
 	task: string;
-	proc: ChildProcess | null;
 	controller: AbortController;
 	startTime: number;
 	lastEventAt: number;
@@ -627,6 +636,7 @@ export function preflightValidateInvocations(
 	port: ModelCatalogPort,
 ): void {
 	for (const invocation of invocations) {
+		childResources(invocation.agent, invocation.extensions, invocation.mcps);
 		const result = validateResolvedModel(invocation.resolvedModel, port, {
 			agentName: invocation.agentName,
 		});
@@ -670,8 +680,6 @@ let bgWidgetInterval: ReturnType<typeof setInterval> | null = null;
 // UI context captured on session_start — used for widget updates
 let uiSetWidget: ((key: string, content: string[] | undefined) => void) | null = null;
 
-/** Path to the bg-signal extension that registers __bg_signal as a real tool in child processes */
-const BG_SIGNAL_EXT_PATH = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "bg-signal.ts");
 
 /**
  * Update the widget showing active background agents.
@@ -830,118 +838,6 @@ async function mapWithConcurrencyLimit<TIn, TOut>(
 	return results;
 }
 
-function writePromptToTempFile(agentName: string, prompt: string): { dir: string; filePath: string } {
-	const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagent-"));
-	const safeName = agentName.replace(/[^\w.-]+/g, "_");
-	const filePath = path.join(tmpDir, `prompt-${safeName}.md`);
-	fs.writeFileSync(filePath, prompt, { encoding: "utf-8", mode: 0o600 });
-	return { dir: tmpDir, filePath };
-}
-
-/**
- * Build the resolved model and thinking-level flags shared by every child spawn.
- * Model strings are normalized defensively so an embedded thinking suffix cannot
- * produce duplicate or conflicting CLI signals.
- */
-export function buildModelArgs(
-	resolved: Pick<ResolvedModelConfig, "model" | "thinkingLevel">,
-): string[] {
-	const normalized = resolved.model === undefined
-		? undefined
-		: normalizeModelString(resolved.model);
-	const effectiveThinkingLevel = resolved.thinkingLevel ?? normalized?.thinkingLevel;
-	const args: string[] = [];
-
-	if (normalized?.base) args.push("--model", normalized.base);
-	if (effectiveThinkingLevel) args.push("--thinking", effectiveThinkingLevel);
-
-	return args;
-}
-
-/**
- * Build the `--tools` / `--no-tools` flag args for a foreground (synchronous) spawn.
- *
- *  - tools omitted (undefined) => no flag (inherit child defaults)
- *  - tools []                 => `--no-tools` (disable all built-in tools)
- *  - tools non-empty           => `--tools a,b,c` (restrict to the listed tools)
- */
-export function buildForegroundToolArgs(tools?: string[]): string[] {
-	if (tools === undefined) return [];
-	if (tools.length === 0) return ["--no-tools"];
-	return ["--tools", tools.join(",")];
-}
-
-/**
- * Build the `--tools` flag args for a background spawn.
- *
- * The background child always needs the internal `__bg_signal` tool (registered via
- * the bg-signal extension, which is always loaded with `-e`). This helper guarantees
- * it survives restrictive allowlists. The `--tools` flag is a name allowlist that
- * applies to built-in, extension, and custom tools alike, so listing only
- * `__bg_signal` activates just that lifecycle tool and no task tools — without
- * depending on the `--no-builtin-tools` flag introduced in Pi 0.80.2:
- *
- *  - tools omitted (undefined) => no flag (existing behavior; child inherits default
- *                                 tools; __bg_signal registered via the loaded extension)
- *  - tools []                  => `--tools __bg_signal` (only the internal lifecycle
- *                                 tool is active; all task tools — built-in, extension,
- *                                 and MCP — are disabled)
- *  - tools non-empty            => `--tools a,b,c,__bg_signal` (appended without duplicates)
- */
-export function buildBackgroundToolArgs(tools?: string[]): string[] {
-	if (tools === undefined) return [];
-	if (tools.length === 0) return ["--tools", "__bg_signal"];
-	if (tools.includes("__bg_signal")) return ["--tools", tools.join(",")];
-	return ["--tools", [...tools, "__bg_signal"].join(",")];
-}
-
-/**
- * Build only the individually-requested isolation flag args (`--no-skills`,
- * `--no-prompt-templates`, `--no-context-files`). Used when a spawn has no
- * system-prompt file to pass (empty body, append/default mode) but still wants
- * to honor per-field isolation overrides.
- */
-export function buildIsolationArgs(opts: {
-	noSkills?: boolean;
-	noPromptTemplates?: boolean;
-	noContextFiles?: boolean;
-}): string[] {
-	const args: string[] = [];
-	if (opts.noSkills) args.push("--no-skills");
-	if (opts.noPromptTemplates) args.push("--no-prompt-templates");
-	if (opts.noContextFiles) args.push("--no-context-files");
-	return args;
-}
-
-/**
- * Build system-prompt and isolation flag args for a spawn (foreground or background).
- *
- *  - systemPromptMode "replace" => `--system-prompt <path>` and automatically adds
- *    `--no-skills`, `--no-prompt-templates`, `--no-context-files`.
- *  - systemPromptMode "append" / undefined (default) => `--append-system-prompt <path>`,
- *    with individually true `noSkills` / `noPromptTemplates` / `noContextFiles` honored.
- */
-export function buildSystemPromptArgs(opts: {
-	systemPromptMode?: "append" | "replace";
-	noSkills?: boolean;
-	noPromptTemplates?: boolean;
-	noContextFiles?: boolean;
-	promptFilePath: string;
-}): string[] {
-	if (opts.systemPromptMode === "replace") {
-		return [
-			"--system-prompt",
-			opts.promptFilePath,
-			"--no-skills",
-			"--no-prompt-templates",
-			"--no-context-files",
-		];
-	}
-	const args: string[] = ["--append-system-prompt", opts.promptFilePath];
-	args.push(...buildIsolationArgs(opts));
-	return args;
-}
-
 /**
  * Resolve agent discovery for a tool invocation by funnelling the cwd/scope
  * fallback through a single pure seam. Project-local `.pi/agents` are
@@ -958,6 +854,14 @@ export function resolveScopeDiscovery(
 
 type OnUpdateCallback = (partial: AgentToolResult<SubagentDetails>) => void;
 
+function childResources(agent: AgentConfig, extensions?: string[], mcps?: string[]) {
+	const agentDir = getAgentDir();
+	return {
+		extensionPaths: resolveExtensionPaths(agentDir, [...new Set([...(agent.extensions ?? []), ...(extensions ?? [])])]),
+		...(mcps?.length ? { mcpServers: loadScopedMcpServers(mcps, agentDir), mcpBridgePath: findMcpBridgePath(agentDir) ?? undefined } : {}),
+	};
+}
+
 async function runSingleAgent(
 	defaultCwd: string,
 	invocation: AgentInvocation,
@@ -965,243 +869,114 @@ async function runSingleAgent(
 	onUpdate: OnUpdateCallback | undefined,
 	makeDetails: (results: SingleResult[]) => SubagentDetails,
 ): Promise<SingleResult> {
-	const agent = invocation.agent;
-	const agentName = invocation.agentName;
-	const task = invocation.display;
-	const cwd = invocation.cwd;
-	const step = invocation.step;
-	const mcps = invocation.mcps;
-	const runtimeExtensions = invocation.extensions;
-	const teamName = invocation.teamName;
-
 	const runId = `fg-${++foregroundAgentSeq}`;
-	const runController = new AbortController();
-	if (signal) {
-		if (signal.aborted) runController.abort();
-		else signal.addEventListener("abort", () => runController.abort(), { once: true });
-	}
-
-	const args: string[] = ["--mode", "json", "-p", "--no-session", "--no-extensions"];
-
-	// Merge extensions from agent frontmatter and runtime (orchestrator) request, deduplicate
-	const agentDir = getAgentDir();
-	const allExtensions = new Set<string>([
-		...(agent.extensions || []),
-		...(runtimeExtensions || []),
-	]);
-	if (allExtensions.size > 0) {
-		const extensionPaths = resolveExtensionPaths(agentDir, [...allExtensions]);
-		for (const extPath of extensionPaths) {
-			args.push("-e", extPath);
-		}
-	}
-
-	// If MCPs are requested, write a scoped config and load only the mcp-bridge extension
-	let mcpConfigPath: string | null = null;
-	let mcpCleanupName: string | null = null;
-	if (mcps && mcps.length > 0 && teamName) {
-		const saveAs = `${agentName}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-		mcpConfigPath = writeScopedMcpConfig(teamName, saveAs, mcps);
-		mcpCleanupName = saveAs;
-		if (mcpConfigPath) {
-			const bridgePath = findMcpBridgePath(agentDir);
-			if (bridgePath) {
-				args.push("-e", bridgePath);
-			}
-		}
-	}
-
-	args.push(...buildModelArgs(invocation.resolvedModel));
-	args.push(...buildForegroundToolArgs(agent.tools));
-
-	const resultModel = invocation.resolvedModel.model === undefined
-		? agent.model
-		: invocation.resolvedModel.model;
-	let tmpPromptDir: string | null = null;
-	let tmpPromptPath: string | null = null;
+	const controller = new AbortController();
+	const abortFromParent = () => controller.abort();
+	if (signal?.aborted) controller.abort();
+	else signal?.addEventListener("abort", abortFromParent, { once: true });
 
 	const currentResult: SingleResult = {
-		agent: agentName,
-		agentSource: agent.source,
-		task,
+		backend: "sdk",
+		agent: invocation.agentName,
+		agentSource: invocation.agent.source,
+		task: invocation.display,
 		promptKind: invocation.promptKind,
 		input: invocation.input,
-		exitCode: -1, // -1 = still running; set to the real code at process close
+		exitCode: -1,
 		messages: [],
 		stderr: "",
 		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
 		...buildResolvedModelMetadata(invocation.resolvedModel),
-		model: resultModel === undefined ? undefined : normalizeModelString(resultModel).base,
-		step,
+		step: invocation.step,
 		startTime: Date.now(),
 	};
-
-	const emitUpdate = () => {
-		if (onUpdate) {
-			onUpdate({
-				content: [{ type: "text", text: getFinalOutput(currentResult.messages) || "(running...)" }],
-				details: makeDetails([currentResult]),
-			});
-		}
-	};
-
-	// Tick elapsed time every second while agent is running
+	const emitUpdate = () => onUpdate?.({
+		content: [{ type: "text", text: getFinalOutput(currentResult.messages) || "(running...)" }],
+		details: makeDetails([currentResult]),
+	});
 	const elapsedInterval = onUpdate ? setInterval(emitUpdate, 1000) : null;
+	let child: SdkChild | undefined;
+	let abortChild: (() => void) | undefined;
 
+	foregroundAgents.set(runId, {
+		id: runId, agentName: invocation.agentName, task: invocation.display,
+		controller, startTime: Date.now(), lastEventAt: Date.now(), turns: 0, result: currentResult,
+	});
 	try {
-		const hasPromptBody = agent.systemPrompt.trim().length > 0;
-		const isReplace = agent.systemPromptMode === "replace";
-
-		if (hasPromptBody || isReplace) {
-			// Write the prompt file (possibly empty for replace mode with an empty
-			// body) and emit the system-prompt flag plus isolation flags.
-			// Replace mode must still pass --system-prompt so Pi's default prompt is
-			// fully overridden, and it auto-adds all three --no-* isolation flags.
-			const tmp = writePromptToTempFile(agent.name, agent.systemPrompt);
-			tmpPromptDir = tmp.dir;
-			tmpPromptPath = tmp.filePath;
-			args.push(...buildSystemPromptArgs({
-				systemPromptMode: agent.systemPromptMode,
-				noSkills: agent.noSkills,
-				noPromptTemplates: agent.noPromptTemplates,
-				noContextFiles: agent.noContextFiles,
-				promptFilePath: tmpPromptPath,
-			}));
-		} else {
-			// Empty body with append/default mode: no prompt file or prompt flag,
-			// but individually-true isolation overrides are still honored.
-			args.push(...buildIsolationArgs({
-				noSkills: agent.noSkills,
-				noPromptTemplates: agent.noPromptTemplates,
-				noContextFiles: agent.noContextFiles,
-			}));
-		}
-
-		args.push(invocation.prompt);
-		let wasAborted = false;
-
-		const exitCode = await new Promise<number>((resolve) => {
-			// Build env: inherit current env, add PI_MCP_CONFIG if MCPs are scoped
-			const spawnEnv = mcpConfigPath
-				? { ...process.env, PI_MCP_CONFIG: mcpConfigPath }
-				: undefined; // undefined = inherit process.env (default)
-
-			const proc = spawn("pi", args, {
-				cwd: cwd ?? defaultCwd,
-				shell: false,
-				stdio: ["ignore", "pipe", "pipe"],
-				...(spawnEnv ? { env: spawnEnv } : {}),
-			});
-			foregroundAgents.set(runId, { id: runId, agentName, task, proc, controller: runController, startTime: Date.now(), lastEventAt: Date.now(), turns: 0, result: currentResult });
-			let buffer = "";
-
-			const processLine = (line: string) => {
-				if (!line.trim()) return;
-				let event: any;
-				try {
-					event = JSON.parse(line);
-				} catch {
-					return;
-				}
-
-				const h = foregroundAgents.get(runId);
-				if (h) h.lastEventAt = Date.now();
-
-				if (event.type === "tool_call") {
-					const toolName = event.name ?? event.toolCall?.name;
-					if (h && typeof toolName === "string") h.currentTool = toolName;
-				}
-
-				if (event.type === "message_end" && event.message) {
-					const msg = event.message as Message;
-					currentResult.messages.push(msg);
-
-					if (msg.role === "assistant") {
-						currentResult.usage.turns++;
-						if (h) h.turns = currentResult.usage.turns;
-						const usage = msg.usage;
-						if (usage) {
-							currentResult.usage.input += usage.input || 0;
-							currentResult.usage.output += usage.output || 0;
-							currentResult.usage.cacheRead += usage.cacheRead || 0;
-							currentResult.usage.cacheWrite += usage.cacheWrite || 0;
-							currentResult.usage.cost += usage.cost?.total || 0;
-							currentResult.usage.contextTokens = usage.totalTokens || 0;
-						}
-						if (!currentResult.model && msg.model) currentResult.model = msg.model;
-						if (!currentResult.provider && (msg as any).provider) currentResult.provider = (msg as any).provider;
-						if (msg.stopReason) currentResult.stopReason = msg.stopReason;
-						if (msg.errorMessage) currentResult.errorMessage = msg.errorMessage;
+		child = await createSdkChild({
+			signal: controller.signal,
+			cwd: invocation.cwd ?? defaultCwd,
+			agent: invocation.agent,
+			resolvedModel: invocation.resolvedModel,
+			...childResources(invocation.agent, invocation.extensions, invocation.mcps),
+			onEvent(event) {
+				const handle = foregroundAgents.get(runId);
+				if (handle) handle.lastEventAt = Date.now();
+				if (event.type === "tool_execution_start" && handle) handle.currentTool = event.toolName;
+				if (event.type === "tool_execution_end" && handle) handle.currentTool = undefined;
+				if (event.type !== "message_end") return;
+				const msg = event.message as Message;
+				currentResult.messages.push(msg);
+				if (msg.role === "assistant") {
+					currentResult.usage.turns++;
+					if (handle) handle.turns = currentResult.usage.turns;
+					const usage = msg.usage;
+					if (usage) {
+						currentResult.usage.input += usage.input || 0;
+						currentResult.usage.output += usage.output || 0;
+						currentResult.usage.cacheRead += usage.cacheRead || 0;
+						currentResult.usage.cacheWrite += usage.cacheWrite || 0;
+						currentResult.usage.cost += usage.cost?.total || 0;
+						currentResult.usage.contextTokens = usage.totalTokens || 0;
 					}
-					emitUpdate();
+					if (!currentResult.model && msg.model) currentResult.model = msg.model;
+					if (!currentResult.provider && msg.provider) currentResult.provider = msg.provider;
+					currentResult.stopReason = msg.stopReason;
+					currentResult.errorMessage = msg.errorMessage;
 				}
-
-				if (event.type === "tool_result_end" && event.message) {
-					currentResult.messages.push(event.message as Message);
-					if (h) h.currentTool = undefined;
-					emitUpdate();
-				}
-			};
-
-			proc.stdout.on("data", (data) => {
-				buffer += data.toString();
-				const lines = buffer.split("\n");
-				buffer = lines.pop() || "";
-				for (const line of lines) processLine(line);
-			});
-
-			proc.stderr.on("data", (data) => {
-				currentResult.stderr += data.toString();
-			});
-
-			proc.on("close", (code) => {
-				if (buffer.trim()) processLine(buffer);
-				resolve(processExitCode(code));
-			});
-
-			proc.on("error", (err) => {
-				currentResult.stderr += `spawn failed: ${err instanceof Error ? err.message : String(err)}`;
-				currentResult.errorMessage = `spawn failed: ${err instanceof Error ? err.message : String(err)}`;
-				resolve(1);
-			});
-
-			const killProc = () => {
-				wasAborted = true;
-				proc.kill("SIGTERM");
-				setTimeout(() => {
-					if (!proc.killed) proc.kill("SIGKILL");
-				}, 5000);
-			};
-			if (runController.signal.aborted) killProc();
-			else runController.signal.addEventListener("abort", killProc, { once: true });
+				emitUpdate();
+			},
 		});
-
-		currentResult.exitCode = exitCode;
-		if (wasAborted) throw new Error("Subagent was aborted");
+		currentResult.model ||= child.session.model?.id;
+		currentResult.provider ||= child.session.model?.provider;
+		currentResult.contextWindow = child.session.model?.contextWindow;
+		abortChild = () => { void child?.abort().catch(() => {}); };
+		controller.signal.addEventListener("abort", abortChild, { once: true });
+		if (controller.signal.aborted) throw new Error("Subagent was aborted");
+		await child.prompt(invocation.prompt);
+		currentResult.exitCode = 0;
+		const stats = child.session.getSessionStats();
+		currentResult.usage = {
+			input: stats.tokens.input,
+			output: stats.tokens.output,
+			cacheRead: stats.tokens.cacheRead,
+			cacheWrite: stats.tokens.cacheWrite,
+			cost: stats.cost,
+			contextTokens: stats.contextUsage?.tokens ?? currentResult.usage.contextTokens,
+			turns: stats.assistantMessages,
+		};
+		if (controller.signal.aborted) throw new Error("Subagent was aborted");
+		emitUpdate();
+		return currentResult;
+	} catch (error) {
+		currentResult.exitCode = 1;
+		const message = error instanceof Error ? error.message : String(error);
+		currentResult.errorMessage = message;
+		currentResult.stderr = message;
+		if (controller.signal.aborted) throw new Error("Subagent was aborted");
 		return currentResult;
 	} finally {
 		foregroundAgents.delete(runId);
-		// Stop elapsed time ticker
+		signal?.removeEventListener("abort", abortFromParent);
+		if (abortChild) controller.signal.removeEventListener("abort", abortChild);
 		if (elapsedInterval) clearInterval(elapsedInterval);
-
-		// Clean up temp prompt file
-		if (tmpPromptPath)
-			try {
-				fs.unlinkSync(tmpPromptPath);
-			} catch {
-				/* ignore */
-			}
-		if (tmpPromptDir)
-			try {
-				fs.rmdirSync(tmpPromptDir);
-			} catch {
-				/* ignore */
-			}
-		if (mcpCleanupName && teamName) {
-			try {
-				removeScopedMcpConfig(teamName, mcpCleanupName);
-			} catch {
-				/* ignore */
+		if (child) {
+			try { await child.dispose(); }
+			catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				currentResult.stderr += `\nSDK cleanup failed: ${message}`;
+				currentResult.exitCode = 1;
+				currentResult.errorMessage ||= message;
 			}
 		}
 	}
@@ -1214,7 +989,7 @@ You have a __bg_signal tool. You MUST call it when:
 - Your task is complete: __bg_signal(status: "done", summary: "what you accomplished")
 - You need input to continue: __bg_signal(status: "question", question: "what you need")
 - You hit an unrecoverable error: __bg_signal(status: "error", error: "what went wrong")
-Do NOT forget to call __bg_signal(status: "done") when you finish your task.
+Call __bg_signal as the ONLY tool in its turn. Do NOT forget to call __bg_signal(status: "done") when you finish your task.
 `.trim();
 
 function generateBgId(agentName: string, explicitId?: string): string {
@@ -1252,221 +1027,150 @@ function resolveId(id: string):
 	return { type: "not_found" };
 }
 
-function buildBgSpawnArgs(
-	agentConfig: AgentConfig,
-	resolved: ResolvedModelConfig,
-	mcps?: string[],
-	runtimeExtensions?: string[],
-	teamName?: string,
-): string[] {
-	const args: string[] = ["--mode", "rpc", "--no-session", "--no-extensions"];
-
-	const agentDir = getAgentDir();
-	const allExtensions = new Set<string>([
-		...(agentConfig.extensions || []),
-		...(runtimeExtensions || []),
-	]);
-	if (allExtensions.size > 0) {
-		const extensionPaths = resolveExtensionPaths(agentDir, [...allExtensions]);
-		for (const extPath of extensionPaths) {
-			args.push("-e", extPath);
-		}
+function finishSdkBackgroundAgent(bgAgent: BackgroundAgent): void {
+	bgAgent.setupController?.abort();
+	if (bgAgent.status === "aborted") bgAgent.result.exitCode = 1;
+	const child = bgAgent.sdk;
+	if (!child) {
+		// SDK creation may still be in flight; its launch callback will see the
+		// terminal status and dispose the session before it can run a prompt.
+		if (bgAgent.sdkReady) return;
+		updateBgWidget();
+		trySpawnQueued();
+		return;
 	}
-
-	if (mcps && mcps.length > 0 && teamName) {
-		const bridgePath = findMcpBridgePath(agentDir);
-		if (bridgePath) {
-			args.push("-e", bridgePath);
+	if (bgAgent.sdkCleanupStarted) return;
+	bgAgent.sdkCleanupStarted = true;
+	bgAgent.sdkCleanup = (async () => {
+		try {
+			await child.dispose();
+		} catch (error) {
+			bgAgent.result.stderr += `\nSDK cleanup failed: ${error instanceof Error ? error.message : String(error)}`;
+		} finally {
+			if (bgAgent.status === "aborted") bgAgent.result.exitCode = 1;
+			bgAgent.sdk = undefined;
+			bgAgent.sdkReady = undefined;
+			updateBgWidget();
+			trySpawnQueued();
 		}
+	})();
+}
+
+async function runSdkBackgroundPrompt(bgAgent: BackgroundAgent, prompt: string): Promise<void> {
+	const child = bgAgent.sdk;
+	if (!child) return;
+	const runId = bgAgent.sdkRunId = (bgAgent.sdkRunId ?? 0) + 1;
+	bgAgent.result.exitCode = -1;
+	try {
+		await child.prompt(prompt);
+		if (runId !== bgAgent.sdkRunId || bgAgent.interrupting || bgAgent.status === "aborted" || bgAgent.status === "done" || bgAgent.status === "error") return;
+		bgAgent.result.exitCode = 0;
+		const stats = child.session.getSessionStats();
+		bgAgent.result.usage = {
+			input: stats.tokens.input,
+			output: stats.tokens.output,
+			cacheRead: stats.tokens.cacheRead,
+			cacheWrite: stats.tokens.cacheWrite,
+			cost: stats.cost,
+			contextTokens: stats.contextUsage?.tokens ?? bgAgent.result.usage.contextTokens,
+			turns: stats.assistantMessages,
+		};
+		const signal = child.takeSignal();
+		const output = getFinalOutput(bgAgent.result.messages) || "(no output)";
+		if (signal?.status === "done") {
+			handleBgSignal(bgAgent, { status: "done", summary: signal.summary || output });
+		} else if (signal?.status === "question") {
+			handleBgSignal(bgAgent, { status: "question", question: signal.question || output });
+		} else if (signal?.status === "error") {
+			handleBgSignal(bgAgent, { status: "error", error: signal.error || output });
+		} else {
+			handleBgSignal(bgAgent, isSuccessfulResult(bgAgent.result)
+				? { status: "done", summary: output }
+				: { status: "error", error: bgAgent.result.errorMessage || output });
+		}
+	} catch (error) {
+		if (runId !== bgAgent.sdkRunId || bgAgent.interrupting || bgAgent.status === "aborted") return;
+		const message = error instanceof Error ? error.message : String(error);
+		bgAgent.result.exitCode = 1;
+		bgAgent.result.errorMessage = message;
+		bgAgent.result.stderr += message;
+		handleBgSignal(bgAgent, { status: "error", error: message });
 	}
-
-	// Always load the bg-signal extension so __bg_signal is a real registered tool
-	args.push("-e", BG_SIGNAL_EXT_PATH);
-
-	args.push(...buildModelArgs(resolved));
-	args.push(...buildBackgroundToolArgs(agentConfig.tools));
-
-	return args;
 }
 
 function launchBackgroundAgent(bgAgent: BackgroundAgent): void {
-	let tmpPromptDir: string | null = null;
-	let tmpPromptPath: string | null = null;
-
-	// Write system prompt with __bg_signal instructions
-	const fullSystemPrompt = [bgAgent.agentConfig.systemPrompt.trim(), BG_SIGNAL_INSTRUCTION]
-		.filter(Boolean)
-		.join("\n\n");
-
-	if (fullSystemPrompt) {
-		const tmp = writePromptToTempFile(bgAgent.agentConfig.name, fullSystemPrompt);
-		tmpPromptDir = tmp.dir;
-		tmpPromptPath = tmp.filePath;
-		bgAgent.tmpPromptDir = tmpPromptDir;
-		bgAgent.tmpPromptPath = tmpPromptPath;
-		bgAgent.spawnArgs.push(...buildSystemPromptArgs({
-			systemPromptMode: bgAgent.agentConfig.systemPromptMode,
-			noSkills: bgAgent.agentConfig.noSkills,
-			noPromptTemplates: bgAgent.agentConfig.noPromptTemplates,
-			noContextFiles: bgAgent.agentConfig.noContextFiles,
-			promptFilePath: tmpPromptPath,
-		}));
-	}
-
-	// Set up MCP config if needed
-	let mcpConfigPath: string | null = null;
-	if (bgAgent.mcps && bgAgent.mcps.length > 0 && bgAgent.teamName) {
-		const mcpSaveAs = `bg-${bgAgent.id}-${Date.now()}`;
-		mcpConfigPath = writeScopedMcpConfig(bgAgent.teamName, mcpSaveAs, bgAgent.mcps);
-		bgAgent.mcpCleanupName = mcpSaveAs;
-	}
-
-	const spawnEnv = mcpConfigPath
-		? { ...process.env, PI_MCP_CONFIG: mcpConfigPath }
-		: undefined;
-
-	const proc = spawn("pi", bgAgent.spawnArgs, {
-		cwd: bgAgent.cwd,
-		shell: false,
-		stdio: ["pipe", "pipe", "pipe"],
-		...(spawnEnv ? { env: spawnEnv } : {}),
-	});
-
-	bgAgent.proc = proc;
 	bgAgent.status = "running";
 	bgAgent.startTime = Date.now();
+	bgAgent.lastEventAt = Date.now();
+	bgAgent.result.backend = "sdk";
+	bgAgent.setupController = new AbortController();
 	updateBgWidget();
 
-	let buffer = "";
-
-	let pendingBgSignal: Record<string, string> | null = null;
-
-	const processLine = (line: string) => {
-		if (!line.trim()) return;
-		let event: any;
-		try {
-			event = JSON.parse(line);
-		} catch {
-			return;
-		}
-		let signalDetected: Record<string, string> | null = pendingBgSignal;
-
-		if (event.type === "tool_call") {
-			const toolName = event.name ?? event.toolCall?.name;
-			const toolArgs = event.arguments ?? event.toolCall?.arguments;
-			if (toolName === "__bg_signal") {
-				pendingBgSignal = (toolArgs || {}) as Record<string, string>;
-				signalDetected = pendingBgSignal;
-			}
-		}
-
-		if (event.type === "message_end" && event.message) {
+	bgAgent.sdkReady = Promise.resolve().then(() => createSdkChild({
+		signal: bgAgent.setupController?.signal,
+		cwd: bgAgent.cwd,
+		agent: bgAgent.agentConfig,
+		resolvedModel: bgAgent.resolvedModel ?? {
+			model: bgAgent.result.resolvedModel,
+			thinkingLevel: bgAgent.result.resolvedThinkingLevel,
+			modelSource: bgAgent.result.configSource ?? "parent",
+			source: bgAgent.result.configSource ?? "parent",
+		},
+		...childResources(bgAgent.agentConfig, bgAgent.extensions, bgAgent.mcps),
+		backgroundInstruction: BG_SIGNAL_INSTRUCTION,
+		onEvent(event) {
+			bgAgent.lastEventAt = Date.now();
+			if (event.type === "tool_execution_start") bgAgent.currentTool = event.toolName;
+			if (event.type === "tool_execution_end") bgAgent.currentTool = undefined;
+			if (event.type !== "message_end") return;
 			const msg = event.message as Message;
 			bgAgent.result.messages.push(msg);
-
-			if (msg.role === "assistant") {
-				for (const part of msg.content) {
-					if (part.type === "toolCall" && part.name === "__bg_signal") {
-						signalDetected = part.arguments as Record<string, string>;
-						pendingBgSignal = signalDetected;
-						break;
-					}
-				}
-
-				bgAgent.result.usage.turns++;
-				const usage = msg.usage;
-				if (usage) {
-					bgAgent.result.usage.input += usage.input || 0;
-					bgAgent.result.usage.output += usage.output || 0;
-					bgAgent.result.usage.cacheRead += usage.cacheRead || 0;
-					bgAgent.result.usage.cacheWrite += usage.cacheWrite || 0;
-					bgAgent.result.usage.cost += usage.cost?.total || 0;
-					bgAgent.result.usage.contextTokens = usage.totalTokens || 0;
-				}
-				if (!bgAgent.result.model && msg.model) bgAgent.result.model = msg.model;
-				if (!bgAgent.result.provider && (msg as any).provider) bgAgent.result.provider = (msg as any).provider;
-				if (msg.stopReason) bgAgent.result.stopReason = msg.stopReason;
-				if (msg.errorMessage) bgAgent.result.errorMessage = msg.errorMessage;
-
-				// Emit turn progress notification (non-interrupting)
-				const turnNum = bgAgent.result.usage.turns;
-				const toolCalls = msg.content
-					.filter((p: any) => p.type === "toolCall")
-					.map((p: any) => p.name)
-					.slice(0, 3);
-				// Idle detection for RPC mode: if turn ended with no __bg_signal and no pending tool calls,
-				// treat as implicit done
-				if ((msg.stopReason as string) === "endTurn" && !signalDetected) {
-					const hasPendingToolCalls = msg.content.some((p: any) => p.type === "toolCall" && p.name !== "__bg_signal");
-					if (!hasPendingToolCalls && bgAgent.status === "running") {
-						handleBgSignal(bgAgent, { status: "done", summary: getFinalOutput(bgAgent.result.messages) || "(no output)" });
-					}
-				}
-
-				if (signalDetected) {
-					pendingBgSignal = null;
-					handleBgSignal(bgAgent, signalDetected);
-				}
+			if (msg.role !== "assistant") return;
+			bgAgent.result.usage.turns++;
+			const usage = msg.usage;
+			if (usage) {
+				bgAgent.result.usage.input += usage.input || 0;
+				bgAgent.result.usage.output += usage.output || 0;
+				bgAgent.result.usage.cacheRead += usage.cacheRead || 0;
+				bgAgent.result.usage.cacheWrite += usage.cacheWrite || 0;
+				bgAgent.result.usage.cost += usage.cost?.total || 0;
+				bgAgent.result.usage.contextTokens = usage.totalTokens || 0;
 			}
+			if (!bgAgent.result.model && msg.model) bgAgent.result.model = msg.model;
+			if (!bgAgent.result.provider && msg.provider) bgAgent.result.provider = msg.provider;
+			bgAgent.result.stopReason = msg.stopReason;
+			bgAgent.result.errorMessage = msg.errorMessage;
+		},
+	}));
+	void bgAgent.sdkReady.then((child) => {
+		bgAgent.sdk = child;
+		bgAgent.result.model ||= child.session.model?.id;
+		bgAgent.result.provider ||= child.session.model?.provider;
+		bgAgent.result.contextWindow = child.session.model?.contextWindow;
+		if (bgAgent.status === "aborted") {
+			finishSdkBackgroundAgent(bgAgent);
+			return;
 		}
-
-		if (event.type === "tool_result_end" && event.message) {
-			bgAgent.result.messages.push(event.message as Message);
+		void runSdkBackgroundPrompt(bgAgent, bgAgent.prompt);
+	}).catch((error) => {
+		bgAgent.sdkReady = undefined;
+		if (bgAgent.status === "aborted") {
+			finishSdkBackgroundAgent(bgAgent);
+			return;
 		}
-	};
-
-	proc.stdout!.on("data", (data: Buffer) => {
-		buffer += data.toString();
-		const lines = buffer.split("\n");
-		buffer = lines.pop() || "";
-		for (const line of lines) processLine(line);
-	});
-
-	proc.stderr!.on("data", (data: Buffer) => {
-		bgAgent.result.stderr += data.toString();
-	});
-
-	proc.on("close", (code: number | null) => {
-		if (buffer.trim()) processLine(buffer);
-		bgAgent.result.exitCode = processExitCode(code);
-
-		// Only finalize if not already done by __bg_signal
-		if (bgAgent.status === "running" || bgAgent.status === "waiting") {
-			const summary = getFinalOutput(bgAgent.result.messages) || "(no output)";
-			handleBgSignal(
-				bgAgent,
-				isSuccessfulResult(bgAgent.result) ? { status: "done", summary } : { status: "error", error: summary },
-			);
-		}
-
-		cleanupBgAgent(bgAgent);
-		updateBgWidget();
-		trySpawnQueued();
-	});
-
-	proc.on("error", () => {
+		const message = error instanceof Error ? error.message : String(error);
 		bgAgent.result.exitCode = 1;
-		if (bgAgent.status === "running" || bgAgent.status === "waiting") {
-			handleBgSignal(bgAgent, { status: "error", error: "Process failed to start" });
-		}
-		cleanupBgAgent(bgAgent);
-		updateBgWidget();
-		trySpawnQueued();
+		bgAgent.result.errorMessage = message;
+		bgAgent.result.stderr += message;
+		handleBgSignal(bgAgent, { status: "error", error: message });
 	});
-
-	// Send initial prompt via stdin
-	const prompt = JSON.stringify({ type: "prompt", message: bgAgent.prompt }) + "\n";
-	proc.stdin!.write(prompt);
 
 	if (!bgAgent.groupId) {
-		piRef?.sendMessage(
-			{
-				customType: "subagent-bg",
-				content: `[🚀 STARTED ${bgAgent.id}] ${bgAgent.agent} — ${bgAgent.task.slice(0, 100)}`,
-				display: true,
-			},
-			{ triggerTurn: false },
-		);
+		piRef?.sendMessage({
+			customType: "subagent-bg",
+			content: `[🚀 STARTED ${bgAgent.id}] ${bgAgent.agent} — ${bgAgent.task.slice(0, 100)}`,
+			display: true,
+		}, { triggerTurn: false });
 	}
 }
 
@@ -1702,7 +1406,6 @@ function advanceChain(group: BackgroundGroup): void {
 
 	const agentConfig = invocation.agent;
 	const memberId = generateMemberId(group.groupId, stepDef.agent, group.chainSteps.map((s) => s.agent));
-	const spawnArgs = buildBgSpawnArgs(agentConfig, stepDef.resolvedModel, stepDef.mcps, stepDef.extensions, group.teamName);
 
 	const bgAgent: BackgroundAgent = {
 		id: memberId,
@@ -1711,7 +1414,6 @@ function advanceChain(group: BackgroundGroup): void {
 		prompt: invocation.prompt,
 		promptKind: invocation.promptKind,
 		input: invocation.input,
-		proc: null,
 		result: {
 			agent: stepDef.agent,
 			agentSource: agentConfig.source,
@@ -1728,8 +1430,8 @@ function advanceChain(group: BackgroundGroup): void {
 		status: "queued",
 		startTime: Date.now(),
 		cwd: stepDef.cwd ?? group.defaultCwd ?? process.cwd(),
+		resolvedModel: stepDef.resolvedModel,
 		agentConfig,
-		spawnArgs,
 		teamName: group.teamName,
 		saveAs: stepDef.saveAs || stepDef.agent,
 		extensions: stepDef.extensions,
@@ -1796,7 +1498,6 @@ function launchBackgroundParallel(
 		const agentConfig = invocation.agent;
 
 		const memberId = generateMemberId(groupId, t.agent, allAgentNames);
-		const spawnArgs = buildBgSpawnArgs(agentConfig, invocation.resolvedModel, invocation.mcps, invocation.extensions, teamName);
 
 		const runningCount = [...backgroundAgents.values()].filter((a) => a.status === "running" || a.status === "waiting").length;
 		const initialStatus = runningCount >= MAX_PARALLEL_AGENTS ? "queued" as const : "running" as const;
@@ -1809,7 +1510,6 @@ function launchBackgroundParallel(
 			prompt: invocation.prompt,
 			promptKind: invocation.promptKind,
 			input: invocation.input,
-			proc: null,
 			result: {
 				agent: t.agent,
 				agentSource: agentConfig.source,
@@ -1826,8 +1526,8 @@ function launchBackgroundParallel(
 			status: initialStatus,
 			startTime: Date.now(),
 			cwd: t.cwd ?? defaultCwd,
+			resolvedModel: invocation.resolvedModel,
 			agentConfig,
-			spawnArgs,
 			teamName,
 			saveAs: t.saveAs || t.agent,
 			extensions: t.extensions,
@@ -1913,7 +1613,6 @@ function launchBackgroundChain(
 	const agentConfig = invocation.agent;
 
 	const memberId = generateMemberId(groupId, firstStep.agent, allAgentNames);
-	const spawnArgs = buildBgSpawnArgs(agentConfig, invocation.resolvedModel, invocation.mcps, invocation.extensions, teamName);
 
 	const runningCount = [...backgroundAgents.values()].filter((a) => a.status === "running" || a.status === "waiting").length;
 	const initialStatus = runningCount >= MAX_PARALLEL_AGENTS ? "queued" as const : "running" as const;
@@ -1925,7 +1624,6 @@ function launchBackgroundChain(
 		prompt: invocation.prompt,
 		promptKind: invocation.promptKind,
 		input: invocation.input,
-		proc: null,
 		result: {
 			agent: firstStep.agent,
 			agentSource: agentConfig.source,
@@ -1942,8 +1640,8 @@ function launchBackgroundChain(
 		status: initialStatus,
 		startTime: Date.now(),
 		cwd: firstStep.cwd ?? defaultCwd,
+		resolvedModel: invocation.resolvedModel,
 		agentConfig,
-		spawnArgs,
 		teamName,
 		saveAs: firstStep.saveAs || firstStep.agent,
 		extensions: firstStep.extensions,
@@ -1970,45 +1668,7 @@ function launchBackgroundChain(
 }
 
 function killBgProcess(bgAgent: BackgroundAgent): void {
-	if (!bgAgent.proc) return;
-	const proc = bgAgent.proc;
-
-	// Track if process has actually exited
-	let exited = false;
-	const onExit = () => {
-		exited = true;
-	};
-	proc.once("exit", onExit);
-
-	try {
-		proc.kill("SIGTERM");
-	} catch {
-		/* already dead */
-		return;
-	}
-
-	setTimeout(() => {
-		if (!exited) {
-			try {
-				proc.kill("SIGKILL");
-			} catch {
-				/* ignore */
-			}
-		}
-		proc.removeListener("exit", onExit);
-	}, 5000);
-}
-
-function cleanupBgAgent(bgAgent: BackgroundAgent): void {
-	if (bgAgent.tmpPromptPath) {
-		try { fs.unlinkSync(bgAgent.tmpPromptPath); } catch { /* ignore */ }
-	}
-	if (bgAgent.tmpPromptDir) {
-		try { fs.rmdirSync(bgAgent.tmpPromptDir); } catch { /* ignore */ }
-	}
-	if (bgAgent.mcpCleanupName && bgAgent.teamName) {
-		try { removeScopedMcpConfig(bgAgent.teamName, bgAgent.mcpCleanupName); } catch { /* ignore */ }
-	}
+	finishSdkBackgroundAgent(bgAgent);
 }
 
 function appendBgUsageEntry(bgAgent: BackgroundAgent, status: BackgroundAgent["status"]): void {
@@ -2050,8 +1710,14 @@ function evictCompletedAgents(): void {
 	}
 }
 
-function shutdownAllBackgroundAgents(): void {
+async function shutdownAllBackgroundAgents(): Promise<void> {
+	const sdkCleanups: Promise<void>[] = [];
 	for (const bgAgent of backgroundAgents.values()) {
+		const ready = bgAgent.sdkReady;
+		sdkCleanups.push((async () => {
+			try { await ready; } catch { /* setup failure is handled by the launcher */ }
+			await bgAgent.sdkCleanup;
+		})());
 		if (bgAgent.status === "running" || bgAgent.status === "waiting") {
 			bgAgent.status = "aborted";
 			bgAgent.endTime = Date.now();
@@ -2078,6 +1744,7 @@ function shutdownAllBackgroundAgents(): void {
 	}
 	backgroundGroups.clear();
 	updateBgWidget();
+	await Promise.allSettled(sdkCleanups);
 }
 
 const SubagentThinkingLevelSchema = StringEnum(
@@ -2085,57 +1752,70 @@ const SubagentThinkingLevelSchema = StringEnum(
 	{ description: "Reasoning level for the selected subagent model" },
 );
 
-const TaskItem = Type.Object({
-	agent: Type.String({ description: "Name of the agent to invoke" }),
-	task: Type.Optional(Type.String({ description: "Task to delegate to the agent" })),
-	input: Type.Optional(Type.Unknown({ description: "Structured input for parameterized agents" })),
-	model: Type.Optional(Type.String({ description: "Model override for this task" })),
-	thinkingLevel: Type.Optional(SubagentThinkingLevelSchema),
-	cwd: Type.Optional(Type.String({ description: "Working directory for the agent process" })),
-	saveAs: Type.Optional(
-		Type.String({ description: "Name for saved output in team mode (default: agent name, or agent-N for parallel)" }),
-	),
-	mcps: Type.Optional(
-		Type.Array(Type.String(), {
-			description:
-				"MCP server names this agent needs (e.g. [\"my-mcp\", \"other-mcp\"]). " +
-				"Only these MCPs are loaded. Omit for no MCPs (fastest). Requires team mode.",
-		}),
-	),
-	extensions: Type.Optional(
-		Type.Array(Type.String(), {
-			description:
-				"Extension names this agent needs (e.g. [\"my-ext\", \"other-ext\"]). " +
-				"Only these extensions are loaded. Merged with agent's frontmatter extensions. Omit for none.",
-		}),
-	),
-});
+function invocationModelOverrideProperties(modelDescription: string) {
+	return {
+		model: Type.Optional(Type.String({ description: modelDescription })),
+		thinkingLevel: Type.Optional(SubagentThinkingLevelSchema),
+	};
+}
 
-const ChainItem = Type.Object({
-	agent: Type.String({ description: "Name of the agent to invoke" }),
-	task: Type.Optional(Type.String({ description: "Task with optional {previous} placeholder for prior output" })),
-	input: Type.Optional(Type.Unknown({ description: "Structured input for parameterized agents. String values support {previous}." })),
-	model: Type.Optional(Type.String({ description: "Model override for this chain step" })),
-	thinkingLevel: Type.Optional(SubagentThinkingLevelSchema),
-	cwd: Type.Optional(Type.String({ description: "Working directory for the agent process" })),
-	saveAs: Type.Optional(
-		Type.String({ description: "Name for saved output in team mode (default: agent name)" }),
-	),
-	mcps: Type.Optional(
-		Type.Array(Type.String(), {
-			description:
-				"MCP server names this agent needs (e.g. [\"my-mcp\", \"other-mcp\"]). " +
-				"Only these MCPs are loaded. Omit for no MCPs (fastest). Requires team mode.",
-		}),
-	),
-	extensions: Type.Optional(
-		Type.Array(Type.String(), {
-			description:
-				"Extension names this agent needs (e.g. [\"my-ext\", \"other-ext\"]). " +
-				"Only these extensions are loaded. Merged with agent's frontmatter extensions. Omit for none.",
-		}),
-	),
-});
+function createTaskItem(allowInvocationModelOverrides: boolean) {
+	return Type.Object({
+		agent: Type.String({ description: "Name of the agent to invoke" }),
+		task: Type.Optional(Type.String({ description: "Task to delegate to the agent" })),
+		input: Type.Optional(Type.Unknown({ description: "Structured input for parameterized agents" })),
+		...(allowInvocationModelOverrides
+			? invocationModelOverrideProperties("Model override for this task")
+			: {}),
+		cwd: Type.Optional(Type.String({ description: "Working directory for the agent process" })),
+		saveAs: Type.Optional(
+			Type.String({ description: "Name for saved output in team mode (default: agent name, or agent-N for parallel)" }),
+		),
+		mcps: Type.Optional(
+			Type.Array(Type.String(), {
+				description:
+					"MCP server names this agent needs (e.g. [\"my-mcp\", \"other-mcp\"]). " +
+					"Only these MCPs are loaded. Omit for no MCPs (fastest). Requires team mode.",
+			}),
+		),
+		extensions: Type.Optional(
+			Type.Array(Type.String(), {
+				description:
+					"Extension names this agent needs (e.g. [\"my-ext\", \"other-ext\"]). " +
+					"Only these extensions are loaded. Merged with agent's frontmatter extensions. Omit for none.",
+			}),
+		),
+	});
+}
+
+function createChainItem(allowInvocationModelOverrides: boolean) {
+	return Type.Object({
+		agent: Type.String({ description: "Name of the agent to invoke" }),
+		task: Type.Optional(Type.String({ description: "Task with optional {previous} placeholder for prior output" })),
+		input: Type.Optional(Type.Unknown({ description: "Structured input for parameterized agents. String values support {previous}." })),
+		...(allowInvocationModelOverrides
+			? invocationModelOverrideProperties("Model override for this chain step")
+			: {}),
+		cwd: Type.Optional(Type.String({ description: "Working directory for the agent process" })),
+		saveAs: Type.Optional(
+			Type.String({ description: "Name for saved output in team mode (default: agent name)" }),
+		),
+		mcps: Type.Optional(
+			Type.Array(Type.String(), {
+				description:
+					"MCP server names this agent needs (e.g. [\"my-mcp\", \"other-mcp\"]). " +
+					"Only these MCPs are loaded. Omit for no MCPs (fastest). Requires team mode.",
+			}),
+		),
+		extensions: Type.Optional(
+			Type.Array(Type.String(), {
+				description:
+					"Extension names this agent needs (e.g. [\"my-ext\", \"other-ext\"]). " +
+					"Only these extensions are loaded. Merged with agent's frontmatter extensions. Omit for none.",
+			}),
+		),
+	});
+}
 
 const AgentScopeSchema = StringEnum(["user", "project", "both"] as const, {
 	description: 'Which agent directories to use. Default: "user". Use "both" to include project-local agents.',
@@ -2153,61 +1833,95 @@ const DescribeAgentParams = Type.Object({
 	cwd: Type.Optional(Type.String({ description: "Directory used to discover project-local .pi/agents. Defaults to current cwd." })),
 });
 
-const SubagentParams = Type.Object({
-	agent: Type.Optional(Type.String({ description: "Name of the agent to invoke (for single mode)" })),
-	task: Type.Optional(Type.String({ description: "Task to delegate (for single mode)" })),
-	input: Type.Optional(Type.Unknown({ description: "Structured input for single mode" })),
-	model: Type.Optional(Type.String({ description: "Invocation-wide model override" })),
-	thinkingLevel: Type.Optional(SubagentThinkingLevelSchema),
-	tasks: Type.Optional(Type.Array(TaskItem, { description: "Array of {agent, task/input} for parallel execution" })),
-	chain: Type.Optional(Type.Array(ChainItem, { description: "Array of {agent, task/input} for sequential execution" })),
-	agentScope: Type.Optional(AgentScopeSchema),
-	confirmProjectAgents: Type.Optional(
-		Type.Boolean({ description: "Prompt before running project-local agents. Default: true.", default: true }),
-	),
-	cwd: Type.Optional(Type.String({ description: "Working directory for the agent process (single mode) and root used to discover project-local .pi/agents. Defaults to current cwd." })),
-	team: Type.Optional(
-		Type.String({
-			description:
-				"Team name for persistent coordination. Enables shared context (from ~/.pi/teams/{name}/shared_context.md), " +
-				"named outputs saved to ~/.pi/teams/{name}/outputs/, and {output:name} placeholders in tasks.",
-		}),
-	),
-	saveAs: Type.Optional(
-		Type.String({ description: "Name for saved output in team mode (single mode only, default: agent name)" }),
-	),
-	mcps: Type.Optional(
-		Type.Array(Type.String(), {
-			description:
-				"MCP server names this agent needs (e.g. [\"my-mcp\", \"other-mcp\"]). " +
-				"Only these MCPs are loaded. Omit for no MCPs (fastest). Requires team mode.",
-		}),
-	),
-	extensions: Type.Optional(
-		Type.Array(Type.String(), {
-			description:
-				"Extension names this agent needs (e.g. [\"my-ext\", \"other-ext\"]). " +
-				"Only these extensions are loaded. Merged with agent's frontmatter extensions. Omit for none.",
-		}),
-	),
-	background: Type.Optional(
-		Type.Boolean({
-			description:
-				"Run the agent in background (non-blocking). Returns immediately with a job ID. " +
-				"Use subagent_status to check progress, subagent_steer to send messages, subagent_stop to kill. " +
-				"Supports single, parallel, and chain modes.",
-			default: false,
-		}),
-	),
-	notifyPerTask: Type.Optional(
-		Type.Boolean({
-			description: "Fire per-task notifications for background parallel/chain (default: true). Set false for group-only completion notifications.",
-			default: true,
-		}),
-	),
-});
+function createSubagentParams(allowInvocationModelOverrides: boolean) {
+	return Type.Object({
+		agent: Type.Optional(Type.String({ description: "Name of the agent to invoke (for single mode)" })),
+		task: Type.Optional(Type.String({ description: "Task to delegate (for single mode)" })),
+		input: Type.Optional(Type.Unknown({ description: "Structured input for single mode" })),
+		...(allowInvocationModelOverrides
+			? invocationModelOverrideProperties("Invocation-wide model override")
+			: {}),
+		tasks: Type.Optional(Type.Array(createTaskItem(allowInvocationModelOverrides), { description: "Array of {agent, task/input} for parallel execution" })),
+		chain: Type.Optional(Type.Array(createChainItem(allowInvocationModelOverrides), { description: "Array of {agent, task/input} for sequential execution" })),
+		agentScope: Type.Optional(AgentScopeSchema),
+		confirmProjectAgents: Type.Optional(
+			Type.Boolean({ description: "Prompt before running project-local agents. Default: true.", default: true }),
+		),
+		cwd: Type.Optional(Type.String({ description: "Working directory for the agent process (single mode) and root used to discover project-local .pi/agents. Defaults to current cwd." })),
+		team: Type.Optional(
+			Type.String({
+				description:
+					"Team name for persistent coordination. Enables shared context (from ~/.pi/teams/{name}/shared_context.md), " +
+					"named outputs saved to ~/.pi/teams/{name}/outputs/, and {output:name} placeholders in tasks.",
+			}),
+		),
+		saveAs: Type.Optional(
+			Type.String({ description: "Name for saved output in team mode (single mode only, default: agent name)" }),
+		),
+		mcps: Type.Optional(
+			Type.Array(Type.String(), {
+				description:
+					"MCP server names this agent needs (e.g. [\"my-mcp\", \"other-mcp\"]). " +
+					"Only these MCPs are loaded. Omit for no MCPs (fastest). Requires team mode.",
+			}),
+		),
+		extensions: Type.Optional(
+			Type.Array(Type.String(), {
+				description:
+					"Extension names this agent needs (e.g. [\"my-ext\", \"other-ext\"]). " +
+					"Only these extensions are loaded. Merged with agent's frontmatter extensions. Omit for none.",
+			}),
+		),
+		background: Type.Optional(
+			Type.Boolean({
+				description:
+					"Run the agent in background (non-blocking). Returns immediately with a job ID. " +
+					"Use subagent_status to check progress, subagent_steer to send messages, subagent_stop to kill. " +
+					"Supports single, parallel, and chain modes.",
+				default: false,
+			}),
+		),
+		notifyPerTask: Type.Optional(
+			Type.Boolean({
+				description: "Fire per-task notifications for background parallel/chain (default: true). Set false for group-only completion notifications.",
+				default: true,
+			}),
+		),
+	});
+}
 
-export default function (pi: ExtensionAPI) {
+const SubagentParams = createSubagentParams(true);
+
+export function buildSubagentParams(
+	allowInvocationModelOverrides: boolean,
+): typeof SubagentParams {
+	return allowInvocationModelOverrides
+		? SubagentParams
+		: createSubagentParams(false);
+}
+
+export interface SubagentExtensionOptions {
+	settings?: SubagentSettings;
+	settingsPath?: string;
+}
+
+export default function (
+	pi: ExtensionAPI,
+	options: SubagentExtensionOptions = {},
+) {
+	const loadedSettings = options.settings === undefined
+		? loadSubagentSettings(options.settingsPath)
+		: {
+				settings: options.settings,
+				path: options.settingsPath ?? "<injected subagent settings>",
+				error: undefined,
+			};
+	if (loadedSettings.error !== undefined) {
+		throw new Error(loadedSettings.error);
+	}
+	const allowInvocationModelOverrides =
+		loadedSettings.settings.allowInvocationModelOverrides;
+	const subagentParams = buildSubagentParams(allowInvocationModelOverrides);
 	piRef = pi;
 	// Register team coordination tools (TeamCreate, TaskCreate, SendMessage, etc.)
 	registerCoordinationTools(pi);
@@ -2227,8 +1941,7 @@ export default function (pi: ExtensionAPI) {
 			sessionModelOverrides = updated;
 		},
 		loadGlobal: loadGlobalConfig,
-		saveGlobal: saveGlobalOverride,
-		resetGlobal: resetGlobalOverride,
+		persistAgentModel: persistAgentModelFile,
 		forceResetGlobal: forceResetGlobalConfig,
 		makePort: makeCatalogPort,
 		parentFor: parentModelForContext,
@@ -2346,10 +2059,18 @@ export default function (pi: ExtensionAPI) {
 			"Team mode: set team param to enable shared context + named outputs. Use {output:name} in tasks to reference previous agent outputs.",
 			"Manage teams: /team new|info|outputs|delete <name>.",
 			"For parameterized agents, use list_subagents() and describe_agent() to get the schema, and pass the data via the `input` parameter.",
+			...(allowInvocationModelOverrides
+				? []
+				: ["Per-invocation model and reasoning overrides are disabled; configured defaults are used."]),
 		].join(" "),
-		parameters: SubagentParams,
+		parameters: subagentParams,
 
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
+			assertInvocationModelOverridesAllowed(
+				params,
+				allowInvocationModelOverrides,
+				loadedSettings.path,
+			);
 			const {
 				config: globalModelConfig,
 				error: globalModelConfigError,
@@ -2453,7 +2174,7 @@ export default function (pi: ExtensionAPI) {
 				const { groupId, memberIds, queuedCount } = launchBackgroundParallel(
 					{ tasks: params.tasks!, saveAs: params.saveAs, notifyPerTask: params.notifyPerTask },
 					ctx.cwd, teamName,
-					invocations
+					invocations,
 				);
 				const runningCount = memberIds.length - queuedCount;
 				return {
@@ -2553,7 +2274,7 @@ export default function (pi: ExtensionAPI) {
 						: undefined;
 
 					const result = await runSingleAgent(
-						ctx.cwd, invocation, signal, chainUpdate, makeDetails("chain")
+						ctx.cwd, invocation, signal, chainUpdate, makeDetails("chain"),
 					);
 					results.push(result);
 
@@ -2636,7 +2357,7 @@ export default function (pi: ExtensionAPI) {
 									emitParallelUpdate();
 								}
 							},
-							makeDetails("parallel")
+							makeDetails("parallel"),
 						);
 
 						// Team mode: save named output
@@ -2706,9 +2427,6 @@ export default function (pi: ExtensionAPI) {
 				if (params.background) {
 					const jobId = generateBgId(invocation.agentName, invocation.saveAs);
 
-					// Build spawn args (same as runSingleAgent but --mode rpc)
-					const spawnArgs = buildBgSpawnArgs(invocation.agent, invocation.resolvedModel, invocation.mcps, invocation.extensions, teamName);
-
 					// Check concurrency
 					const runningCount = [...backgroundAgents.values()].filter(
 						(a) => a.status === "running" || a.status === "waiting",
@@ -2721,7 +2439,6 @@ export default function (pi: ExtensionAPI) {
 						prompt: invocation.prompt,
 						promptKind: invocation.promptKind,
 						input: invocation.input,
-						proc: null,
 						result: {
 							agent: invocation.agentName,
 							agentSource: invocation.agent.source,
@@ -2738,8 +2455,8 @@ export default function (pi: ExtensionAPI) {
 						status: runningCount >= MAX_PARALLEL_AGENTS ? "queued" : "running",
 						startTime: Date.now(),
 						cwd: invocation.cwd ?? ctx.cwd,
+						resolvedModel: invocation.resolvedModel,
 						agentConfig: invocation.agent,
-						spawnArgs,
 						teamName,
 						saveAs: invocation.saveAs,
 						extensions: invocation.extensions,
@@ -2931,6 +2648,7 @@ export default function (pi: ExtensionAPI) {
 					}
 					const usageStr = formatUsageStats(r.usage, r.model ?? r.resolvedModel, {
 						provider: r.provider,
+						contextWindow: r.contextWindow,
 						elapsedMs: Date.now() - r.startTime,
 						thinkingLevel: r.resolvedThinkingLevel,
 						source: r.configSource,
@@ -2954,6 +2672,7 @@ export default function (pi: ExtensionAPI) {
 				}
 				const usageStr = formatUsageStats(r.usage, r.model ?? r.resolvedModel, {
 					provider: r.provider,
+					contextWindow: r.contextWindow,
 					elapsedMs: Date.now() - r.startTime,
 					thinkingLevel: r.resolvedThinkingLevel,
 					source: r.configSource,
@@ -3036,6 +2755,7 @@ export default function (pi: ExtensionAPI) {
 
 						const stepUsage = formatUsageStats(r.usage, r.model ?? r.resolvedModel, {
 							provider: r.provider,
+							contextWindow: r.contextWindow,
 							elapsedMs: Date.now() - r.startTime,
 							thinkingLevel: r.resolvedThinkingLevel,
 							source: r.configSource,
@@ -3133,6 +2853,7 @@ export default function (pi: ExtensionAPI) {
 
 						const taskUsage = formatUsageStats(r.usage, r.model ?? r.resolvedModel, {
 							provider: r.provider,
+							contextWindow: r.contextWindow,
 							elapsedMs: Date.now() - r.startTime,
 							thinkingLevel: r.resolvedThinkingLevel,
 							source: r.configSource,
@@ -3234,36 +2955,30 @@ export default function (pi: ExtensionAPI) {
 					isError: true,
 				};
 			}
-			if (!bgAgent.proc || bgAgent.proc.killed) {
-				return {
-					content: [{ type: "text", text: `Agent "${params.id}" process is not alive.` }],
-					details: undefined,
-					isError: true,
-				};
+			const child = bgAgent.sdk ?? await bgAgent.sdkReady;
+			if (!child || (bgAgent.status !== "running" && bgAgent.status !== "waiting") || bgAgent.sdkCleanupStarted) {
+				throw new Error(`Agent "${params.id}" is no longer running`);
 			}
-
 			if (params.interrupt) {
-				bgAgent.proc.stdin!.write(JSON.stringify({ type: "abort" }) + "\n");
-				await new Promise((r) => setTimeout(r, 500));
+				bgAgent.sdkRunId = (bgAgent.sdkRunId ?? 0) + 1;
+				bgAgent.interrupting = true;
+				try {
+					await child.abort();
+					child.takeSignal();
+				} finally { bgAgent.interrupting = false; }
 			}
-
-			const steerMsg = bgAgent.status === "waiting"
-				? JSON.stringify({ type: "prompt", message: params.message }) + "\n"
-				: JSON.stringify({ type: "steer", message: params.message }) + "\n";
-
-			bgAgent.proc.stdin!.write(steerMsg);
-			if (bgAgent.status === "waiting") {
+			if ((bgAgent.status !== "running" && bgAgent.status !== "waiting") || bgAgent.sdkCleanupStarted) {
+				return { content: [{ type: "text", text: `Agent "${params.id}" was stopped before steering completed.` }], details: undefined };
+			}
+			if (bgAgent.status === "waiting" || params.interrupt) {
 				bgAgent.status = "running";
 				updateBgWidget();
+				void runSdkBackgroundPrompt(bgAgent, params.message);
+			} else {
+				await child.steer(params.message);
 			}
-
 			return {
-				content: [
-					{
-						type: "text",
-						text: `Steered "${params.id}": ${params.interrupt ? "(interrupted) " : ""}${params.message.slice(0, 100)}`,
-					},
-				],
+				content: [{ type: "text", text: `Steered "${params.id}": ${params.interrupt ? "(interrupted) " : ""}${params.message.slice(0, 100)}` }],
 				details: undefined,
 			};
 		},
@@ -3345,6 +3060,7 @@ export default function (pi: ExtensionAPI) {
 					.slice(-5);
 				const usageStr = formatUsageStats(bgAgent.result.usage, bgAgent.result.model ?? bgAgent.result.resolvedModel, {
 					provider: bgAgent.result.provider,
+					contextWindow: bgAgent.result.contextWindow,
 					elapsedMs,
 					thinkingLevel: bgAgent.result.resolvedThinkingLevel,
 					source: bgAgent.result.configSource,
@@ -3590,7 +3306,8 @@ export default function (pi: ExtensionAPI) {
 
 	// ── Session cleanup ──────────────────────────────────────────────
 	pi.on("session_shutdown", async () => {
-		shutdownAllBackgroundAgents();
+		await shutdownAllBackgroundAgents();
+		uiSetWidget = null;
 	});
 
 	// ── Agent management commands ───────────────────────────────────
@@ -3637,6 +3354,8 @@ export default function (pi: ExtensionAPI) {
 									task: a.task,
 									startTime: a.startTime,
 									status: a.status,
+									lastEventAt: a.lastEventAt,
+									currentTool: a.currentTool,
 									output: getFinalOutput(a.result.messages),
 									transcript: buildTranscript(a.task, a.result.messages),
 								});
