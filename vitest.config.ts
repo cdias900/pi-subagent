@@ -39,12 +39,21 @@ function resolveJsToTs() {
 
 export default defineConfig({
   plugins: [resolveJsToTs()],
+  // Match Pi's host module aliases; never test against an older physical SDK copy.
+  resolve: {
+    alias: [
+      { find: "@mariozechner/pi-coding-agent", replacement: resolve(__dirname, "node_modules/@earendil-works/pi-coding-agent/dist/index.js") },
+      { find: "@mariozechner/pi-agent-core", replacement: resolve(__dirname, "node_modules/@earendil-works/pi-agent-core/dist/index.js") },
+      { find: "@mariozechner/pi-ai", replacement: resolve(__dirname, "node_modules/@earendil-works/pi-ai/dist/compat.js") },
+      { find: "@mariozechner/pi-tui", replacement: resolve(__dirname, "node_modules/@earendil-works/pi-tui/dist/index.js") },
+      { find: /^@sinclair\/typebox$/, replacement: resolve(__dirname, "node_modules/typebox/build/index.mjs") },
+      { find: /^@sinclair\/typebox\/(.*)$/, replacement: resolve(__dirname, "node_modules/typebox/build/$1/index.mjs") },
+    ],
+  },
   test: {
     include: ["**/*.test.ts"],
-    // The host SDK contract test is host-specific (it asserts symbols on
-    // @earendil-works/pi-ai/compat) and runs under its own config via
-    // `npm run test:host`. Exclude it from the default suite, which resolves
-    // `@mariozechner/pi-ai` to the pinned 0.56.1 devDependency.
+    // The host SDK contract has its own focused command/config, but both suites
+    // now resolve the same current SDK and AI compat exports.
     exclude: ["**/node_modules/**", "./host-sdk-contract.test.ts"],
   },
 });

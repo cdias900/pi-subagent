@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { existsSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { createServer } from "node:http";
@@ -178,6 +178,42 @@ describe("one in-process SDK execution path", () => {
 		const result = await invokeAgent({ agent: "offline", task: "retry-once" });
 		expect(result.details.results[0].stopReason).toBe("stop");
 		expect(fixture.requests).toHaveLength(2);
+	});
+
+	it.each(["controller", "dispose"] as const)("aborts a running model before slow native shutdown via %s", async (stop) => {
+		const started = join(fixture.root, "shutdown-started");
+		const release = join(fixture.root, "shutdown-release");
+		const path = fixture.extension("slow-shutdown", `
+import { existsSync, writeFileSync } from 'node:fs';
+export default function(pi) {
+ pi.on('session_shutdown', async () => {
+  writeFileSync(${JSON.stringify(started)}, 'started');
+  while (!existsSync(${JSON.stringify(release)})) await new Promise(resolve => setTimeout(resolve, 10));
+ });
+}`);
+		const controller = new AbortController();
+		const child = await createSdkChild({ cwd: fixture.cwd, agent, resolvedModel: model, extensionPaths: [path], signal: controller.signal, backgroundInstruction: "Read-only cancellation fixture", onEvent() {} });
+		const abort = vi.spyOn(child.session.agent, "abort");
+		const pending = child.prompt("slow").catch(() => {});
+		let stopping: Promise<void> | undefined;
+		try {
+			const deadline = Date.now() + 4000;
+			while (fixture.requests.length === 0 && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 10));
+			expect(fixture.requests.length).toBeGreaterThan(0);
+			expect(child.session.isStreaming).toBe(true);
+			abort.mockClear();
+			if (stop === "controller") controller.abort(); else stopping = child.dispose();
+			expect(abort).toHaveBeenCalled();
+			while ((!existsSync(started) || child.session.isStreaming) && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 10));
+			expect(existsSync(started)).toBe(true);
+			expect(child.session.isStreaming).toBe(false);
+			expect(existsSync(release)).toBe(false);
+		} finally {
+			writeFileSync(release, "release");
+			await stopping;
+			await child.dispose();
+			await pending;
+		}
 	});
 
 	it("aborts a running foreground SDK session", async () => {

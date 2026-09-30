@@ -14,8 +14,6 @@ import {
 	type AgentSessionRuntime,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { existsSync } from "node:fs";
-import { join } from "node:path";
 import type { AgentConfig } from "./agents.js";
 import type { ResolvedModelConfig } from "./model-resolution.js";
 import { loadChildExtensions } from "./sdk-extensions.js";
@@ -38,8 +36,7 @@ export interface SdkChild {
 
 /** Match the non-interactive CLI child's saved/default project-trust decision. */
 export function resolveSdkProjectTrust(cwd: string, agentDir = getAgentDir()): boolean {
-	// Pi 0.83 predates native MCP and does not include mcp.json in its trust gate.
-	if (!hasTrustRequiringProjectResources(cwd) && !existsSync(join(cwd, ".pi", "mcp.json"))) return true;
+	if (!hasTrustRequiringProjectResources(cwd)) return true;
 	const saved = new ProjectTrustStore(agentDir).get(cwd);
 	if (saved !== null) return saved;
 	return SettingsManager.create(cwd, agentDir, { projectTrusted: false }).getDefaultProjectTrust() === "always";
@@ -101,7 +98,7 @@ export async function createSdkChild(options: {
 	const extensions = await loadChildExtensions(extensionPaths, cwd);
 	checkAbort();
 	const mcp = options.mcpServers && Object.keys(options.mcpServers).length > 0
-		? createScopedMcpExtension({ servers: options.mcpServers, cwd, signal: options.signal })
+		? createScopedMcpExtension(options.mcpServers, cwd)
 		: undefined;
 	const models = await createChildModelRuntime(cwd, agentDir, options.signal);
 	let runtime: AgentSessionRuntime;
@@ -117,7 +114,7 @@ export async function createSdkChild(options: {
 					modelRuntime: models.modelRuntime,
 					resourceLoaderOptions: {
 						noExtensions: true,
-						extensionFactories: [...extensions, ...(mcp ? [mcp.extension] : [])],
+						extensionFactories: [...extensions, ...(mcp ? [mcp] : [])],
 						noSkills: replace || agent.noSkills === true,
 						noPromptTemplates: replace || agent.noPromptTemplates === true,
 						noContextFiles: replace || agent.noContextFiles === true,
@@ -152,21 +149,38 @@ export async function createSdkChild(options: {
 		);
 	} catch (error) {
 		models.cleanup();
-		await mcp?.dispose();
 		throw error;
 	}
 	const session = runtime.session;
+	let disposed = false;
+	let stopping = false;
+	let shutdown: Promise<void> | undefined;
+	let activePrompt: Promise<void> | undefined;
+	let unsubscribe = () => {};
+	// Emit native session_shutdown immediately, including during startup/preflight.
+	// Pi owns connection cleanup; in 0.99.1 an initializing client can remain
+	// alive until initialization settles or its native request timeout fires.
+	const dispose = (): Promise<void> => {
+		if (shutdown) return shutdown;
+		disposed = true;
+		stopping = true;
+		session.agent.abort();
+		options.signal?.removeEventListener("abort", onAbort);
+		unsubscribe();
+		shutdown = runtime.dispose().finally(() => models.cleanup());
+		return shutdown;
+	};
+	const onAbort = () => { void dispose().catch(() => {}); };
+	options.signal?.addEventListener("abort", onAbort, { once: true });
 	try {
 		checkAbort();
 		await session.bindExtensions({ mode: isBackground ? "rpc" : "json" });
-		await mcp?.ready();
 		checkAbort();
 	} catch (error) {
-		try { await runtime.dispose(); }
-		finally { models.cleanup(); }
+		await dispose();
 		throw error;
 	}
-	const unsubscribe = session.subscribe((event) => {
+	unsubscribe = session.subscribe((event) => {
 		if (isBackground && event.type === "message_end" && event.message.role === "assistant") {
 			const calls = event.message.content.filter((part) => part.type === "toolCall");
 			if (calls.length > 1 && calls.some((call) => call.name === "__bg_signal")) {
@@ -179,11 +193,9 @@ export async function createSdkChild(options: {
 		}
 		onEvent(event);
 	});
-	let disposed = false;
-	let stopping = false;
-	let activePrompt: Promise<void> | undefined;
 
 	const prompt = async (message: string): Promise<void> => {
+		checkAbort();
 		if (disposed || stopping) throw new Error("Subagent was aborted");
 		const pending = session.prompt(message, {
 			source: isBackground ? "rpc" : "interactive",
@@ -209,7 +221,11 @@ export async function createSdkChild(options: {
 	return {
 		session,
 		prompt,
-		steer: (message) => session.steer(message),
+		steer: async (message) => {
+			checkAbort();
+			if (disposed || stopping) throw new Error("Subagent was aborted");
+			await session.steer(message);
+		},
 		abort,
 		takeSignal() {
 			if (protocolError) {
@@ -223,14 +239,8 @@ export async function createSdkChild(options: {
 			return signal;
 		},
 		async dispose() {
-			if (disposed) return;
-			disposed = true;
-			try { await abort(); }
-			finally {
-				unsubscribe();
-				try { await runtime.dispose(); }
-				finally { models.cleanup(); }
-			}
+			await dispose();
+			await activePrompt?.catch(() => {});
 		},
 	};
 }

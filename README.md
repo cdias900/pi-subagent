@@ -28,7 +28,7 @@ subagent({ agent: "scout", task: "Explore the codebase" })
 
 Every child uses the same **in-process Pi SDK session** path for foreground and background single, parallel, and chain runs. There is no backend selector, CLI runner, or agent sidecar. Each child has its own conversation, model runtime, resource loader, tools, and working directory. Extensions declared by an agent are loaded from the same installed sources as the parent, with fresh module state per child. They are not borrowed as live executable tools from the parent: Pi's public extension API exposes tool metadata, not execution callbacks.
 
-Fresh extension modules avoid cross-agent mutable state (for example Buildkite's active abort signal) without extra Pi processes. MCP server configs are passed to per-session clients rather than changing `process.env.PI_MCP_CONFIG`; stdio MCP servers may still start their own configured server processes. Model-key/header `!commands` are bound to the child's working directory without changing `process.cwd()`. Shared disk configuration remains user-owned.
+Fresh extension modules avoid cross-agent mutable state (for example Buildkite's active abort signal) without extra Pi processes. Requested MCP servers are registered in per-session native extensions without changing global configuration or environment; stdio MCP servers may still start their own configured server processes. Model-key/header `!commands` are bound to the child's working directory without changing `process.cwd()`. Shared disk configuration remains user-owned.
 
 This is context and extension-state isolation, **not a process or filesystem sandbox**. Trusted extensions that mutate global process state or block the event loop can still affect the parent. Abort is cooperative; there is no child Pi process to SIGKILL.
 
@@ -217,7 +217,7 @@ These tools are compatible with [Claude Code's agent team system](https://code.c
 
 ### MCP Scoping for Subagents
 
-Control which MCP servers a subagent can access. Servers are selected from native Pi configuration: `~/.pi/agent/mcp.json` (or the configured agent directory) and the trusted child's `.pi/mcp.json`, both using `{ "mcpServers": { ... } }`. Project entries replace global entries with the same name; no bridge extension is required.
+Control which MCP servers a subagent can access. Servers are selected from native Pi configuration: `~/.pi/agent/mcp.json` (or the configured agent directory) and the trusted child's `.pi/mcp.json`, both using `{ "mcpServers": { ... } }`. Project entries replace global entries with the same name. Scoped sessions use Pi's native MCP, codemode and tool-search extensions; there is no bridge or alternate client backend.
 
 ```
 subagent({
@@ -229,7 +229,11 @@ subagent({
 })
 ```
 
-Omit `mcps` for fastest startup (no MCP servers loaded).
+Omit `mcps` for fastest startup (no MCP servers loaded). Configured exposure is preserved: `codemode` is Pi's default, `deferred` enables tool search, and `direct` declares tools immediately. Native MCP owns transport validation, headers/secrets, OAuth credentials, resources, reconnection and shutdown. Authenticate OAuth servers in the parent Pi session with `/mcp login <server>` or `pi mcp login <server>`; children reuse the native credential store and do not open an unattended sign-in flow. Legacy flat bridge files, `PI_MCP_CONFIG`, bridge credentials and SSE fallback are not supported.
+
+### Native SDK startup-cancellation limitation
+
+Pi 0.99.1 does not retain its native client for shutdown until initialization finishes. Cancelling or disposing a child stops new agent work and closes established MCP connections, but a connection still initializing can remain alive until initialization settles or its native request timeout fires (60 seconds by default, configurable per server). This is an upstream native-runtime limitation, not a bridge fallback: subagents do not recreate clients, import private SDK internals or kill arbitrary server processes to hide it. Regression tests use a two-second loopback timeout to verify the observed delayed cleanup; their passing result does not imply immediate startup teardown.
 
 ## Default Agents
 
@@ -519,7 +523,7 @@ pi-subagent/
 ├── sdk-runner.ts            # Ephemeral SDK child sessions and trust/resource configuration
 ├── sdk-extensions.ts        # Fresh child extension modules using the host SDK
 ├── sdk-model-runtime.ts     # Cwd-bound model command credentials
-├── sdk-mcp.ts               # Session-scoped MCP clients and tools
+├── sdk-mcp.ts               # Requested-server selection and native MCP extension setup
 ├── agents.ts                # Agent discovery (bundled + user + project)
 ├── invocation.ts            # Invocation validation, prompt construction, and model layering
 ├── invocation-policy.ts     # Per-invocation model override configuration and enforcement
@@ -541,8 +545,8 @@ pi-subagent/
 
 ## Compatibility
 
-- **Pi 0.83.0 or later is required.** The extension uses only the host's `@earendil-works/pi-coding-agent` SDK. Backend environment switches are no longer read; rollback requires restoring a prior extension revision.
-- Scoped MCP keeps the `mcp__server__tool` names and session-local HTTP/stdio clients for compatibility with Pi SDK 0.83. Servers may omit `type` (inferred from `command` or `url`); `streamable-http` is accepted, and disabled servers cannot be selected. Stdio defaults to the child's cwd, with a configured relative `cwd` resolved against it. Scoped children expose tools directly (also when `exposure` is omitted); retain `exposure: "direct"` for scoped servers. Selected entries with headers, OAuth settings, non-direct exposure, `toolExposure`, native timeout settings, env secret expansion (`${NAME}` / `!command`), or `~/` paths fail explicitly rather than being silently ignored. This is not the native MCP runtime: native OAuth credentials, resources, and reconnection are not implemented here. OAuth-only servers cannot currently be used by scoped children, even after parent login. The old bridge config and credential store are not read.
+- **Version 3 requires Pi 0.99.1 or later.** Native MCP is the only MCP runtime. Older Pi SDKs and the bridge backend are not supported; update Pi before updating this package. Interoperability aliases for other explicitly requested extensions still resolve to the current host SDK, not an older SDK copy.
+- Scoped MCP keeps the native `mcp__server__tool` names, selected-server boundary, child cwd and project-trust rules. Server fields and exposure follow Pi's native contract, including `toolExposure`, environment/command-based secrets, OAuth, resources, timeouts and tilde paths. Disabled or unconfigured requested servers cannot be selected. No custom client, transport fallback, tool conversion, cache or bridge credential reader remains.
 - **`/agent-model global` now edits user-agent frontmatter.** It no longer writes ordinary selections to `subagent-models.json`. Existing legacy JSON entries are still read and must be migrated or removed before changing the same agent's frontmatter.
 - **Invocation model overrides remain enabled by default.** Existing callers keep the current `model` and `thinkingLevel` fields unless `allowInvocationModelOverrides` is set to `false` in `~/.pi/agent/subagent-settings.json`.
 - **`tools: []` semantics (intentional change):** earlier pi-subagent versions

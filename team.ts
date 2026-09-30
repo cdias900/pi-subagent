@@ -4,7 +4,6 @@
  * A team is a persistent coordination layer that:
  *   - Maintains a shared context file injected into every agent's prompt
  *   - Stores named outputs from agents, referenceable via {output:name} placeholders
- *   - Optionally scopes MCP access per-agent-run via a generated PI_MCP_CONFIG file
  *
  * Directory structure:
  *   ~/.pi/teams/{team-name}/
@@ -12,7 +11,6 @@
  *     shared_context.md   # injected into every agent's task
  *     outputs/            # named outputs from agents
  *       {name}.md         # one file per agent output
- *     .mcp-{name}.json    # scoped MCP config (temp, per agent run)
  */
 
 import * as fs from "node:fs";
@@ -108,46 +106,6 @@ export function listOutputs(teamName: string): string[] {
 			.map((f) => f.replace(/\.md$/, ""));
 	} catch {
 		return [];
-	}
-}
-
-// ── Scoped MCP configs ─────────────────────────────────────────────────
-
-function scopedMcpConfigPath(teamName: string, saveAs: string): string {
-	validateTeamPathName(saveAs, "Scoped config name");
-	return path.join(getTeamDir(teamName), `.mcp-${saveAs}.json`);
-}
-
-/**
- * Writes a scoped MCP config containing only the requested MCP server names.
- * Source of truth is ~/.pi/mcp.json.
- */
-export function writeScopedMcpConfig(teamName: string, saveAs: string, mcpNames: string[]): string | null {
-	const globalConfigPath = path.join(os.homedir(), ".pi", "mcp.json");
-	let allServers: Record<string, any> = {};
-	try {
-		allServers = JSON.parse(fs.readFileSync(globalConfigPath, "utf-8"));
-	} catch {
-		return null;
-	}
-
-	const scoped: Record<string, any> = {};
-	for (const name of mcpNames) {
-		if (allServers[name]) scoped[name] = allServers[name];
-	}
-
-	if (Object.keys(scoped).length === 0) return null;
-
-	const outPath = scopedMcpConfigPath(teamName, saveAs);
-	fs.writeFileSync(outPath, JSON.stringify(scoped, null, 2) + "\n");
-	return outPath;
-}
-
-export function removeScopedMcpConfig(teamName: string, saveAs: string): void {
-	try {
-		fs.unlinkSync(scopedMcpConfigPath(teamName, saveAs));
-	} catch {
-		/* ignore */
 	}
 }
 

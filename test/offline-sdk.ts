@@ -45,7 +45,8 @@ export async function offlineSdkFixture() {
 		const request: ModelRequest = JSON.parse(Buffer.concat(chunks).toString("utf8"));
 		requests.push({ ...request, authorization: req.headers.authorization });
 		const prompt = JSON.stringify(request.messages.filter((m) => m.role === "user").at(-1)?.content ?? "");
-		const hasResult = request.messages.some((m) => m.role === "tool");
+		const turnMessages = request.messages.slice(request.messages.map((m) => m.role).lastIndexOf("user"));
+		const hasResult = turnMessages.some((m) => m.role === "tool");
 		if (prompt.includes("failure") || prompt.includes("retry-once") && failures++ === 0) {
 			res.writeHead(prompt.includes("retry-once") ? 500 : 400, { "content-type": "application/json" });
 			res.end(JSON.stringify({ error: { message: "scripted model failure", type: "invalid_request_error" } }));
@@ -69,6 +70,15 @@ export async function offlineSdkFixture() {
 			completion(res, hasResult ? "Write completed" : { name: "write", arguments: { path: "written.txt", content: "written-content" } });
 		} else if (prompt.includes("gateway-fixture")) {
 			completion(res, hasResult ? (JSON.stringify(request.messages).includes("mock_ping") ? "Gateway usable" : "Gateway missing") : { name: "tool_gateway_search_tools", arguments: { query: "mock_ping", include_direct: true } });
+		} else if (prompt.includes("mcp-codemode")) {
+			completion(res, hasResult ? "Codemode completed" : { name: "codemode", arguments: { code: "const result = await tools.mcp__alpha__ping({value: 'test'}); text(result);" } });
+		} else if (prompt.includes("mcp-search")) {
+			const searched = turnMessages.some((m) => m.role === "tool" && JSON.stringify(m).includes("mcp__alpha__ping"));
+			completion(res, !hasResult ? { name: "tool_search", arguments: { query: "mcp__alpha__ping" } }
+				: searched && !turnMessages.some((m) => m.role === "tool" && JSON.stringify(m).includes("mcp-fixture-response"))
+					? { name: "mcp__alpha__ping", arguments: { value: "test" } } : "Search completed");
+		} else if (prompt.includes("mcp-resource")) {
+			completion(res, hasResult ? "Resource completed" : { name: "read_mcp_resource", arguments: { server: "alpha", uri: "fixture://text" } });
 		} else if (prompt.includes("mcp-fixture")) {
 			completion(res, hasResult ? "MCP usable" : { name: "mcp__alpha__ping", arguments: { value: "test" } });
 		} else completion(res, "Offline parity: café 🚀");

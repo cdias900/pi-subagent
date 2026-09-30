@@ -1722,11 +1722,13 @@ const SubagentThinkingLevelSchema = StringEnum(
 	{ description: "Reasoning level for the selected subagent model" },
 );
 
-function invocationModelOverrideProperties(modelDescription: string) {
-	return {
+function invocationModelOverrideProperties(modelDescription: string, enabled: boolean) {
+	const properties = {
 		model: Type.Optional(Type.String({ description: modelDescription })),
 		thinkingLevel: Type.Optional(SubagentThinkingLevelSchema),
 	};
+	// Payload fields stay optional in both modes; the disabled schema omits them.
+	return enabled ? properties : {} as typeof properties;
 }
 
 function createTaskItem(allowInvocationModelOverrides: boolean) {
@@ -1734,9 +1736,7 @@ function createTaskItem(allowInvocationModelOverrides: boolean) {
 		agent: Type.String({ description: "Name of the agent to invoke" }),
 		task: Type.Optional(Type.String({ description: "Task to delegate to the agent" })),
 		input: Type.Optional(Type.Unknown({ description: "Structured input for parameterized agents" })),
-		...(allowInvocationModelOverrides
-			? invocationModelOverrideProperties("Model override for this task")
-			: {}),
+		...invocationModelOverrideProperties("Model override for this task", allowInvocationModelOverrides),
 		cwd: Type.Optional(Type.String({ description: "Working directory for the agent process" })),
 		saveAs: Type.Optional(
 			Type.String({ description: "Name for saved output in team mode (default: agent name, or agent-N for parallel)" }),
@@ -1763,9 +1763,7 @@ function createChainItem(allowInvocationModelOverrides: boolean) {
 		agent: Type.String({ description: "Name of the agent to invoke" }),
 		task: Type.Optional(Type.String({ description: "Task with optional {previous} placeholder for prior output" })),
 		input: Type.Optional(Type.Unknown({ description: "Structured input for parameterized agents. String values support {previous}." })),
-		...(allowInvocationModelOverrides
-			? invocationModelOverrideProperties("Model override for this chain step")
-			: {}),
+		...invocationModelOverrideProperties("Model override for this chain step", allowInvocationModelOverrides),
 		cwd: Type.Optional(Type.String({ description: "Working directory for the agent process" })),
 		saveAs: Type.Optional(
 			Type.String({ description: "Name for saved output in team mode (default: agent name)" }),
@@ -1808,9 +1806,7 @@ function createSubagentParams(allowInvocationModelOverrides: boolean) {
 		agent: Type.Optional(Type.String({ description: "Name of the agent to invoke (for single mode)" })),
 		task: Type.Optional(Type.String({ description: "Task to delegate (for single mode)" })),
 		input: Type.Optional(Type.Unknown({ description: "Structured input for single mode" })),
-		...(allowInvocationModelOverrides
-			? invocationModelOverrideProperties("Invocation-wide model override")
-			: {}),
+		...invocationModelOverrideProperties("Invocation-wide model override", allowInvocationModelOverrides),
 		tasks: Type.Optional(Type.Array(createTaskItem(allowInvocationModelOverrides), { description: "Array of {agent, task/input} for parallel execution" })),
 		chain: Type.Optional(Type.Array(createChainItem(allowInvocationModelOverrides), { description: "Array of {agent, task/input} for sequential execution" })),
 		agentScope: Type.Optional(AgentScopeSchema),

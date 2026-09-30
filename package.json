@@ -1,6 +1,6 @@
 {
   "name": "pi-subagent",
-  "version": "2.0.0",
+  "version": "3.0.0",
   "description": "Multi-agent orchestration for PI — spawn specialized agents, coordinate teams, share context",
   "keywords": [
     "pi-package",
@@ -23,7 +23,7 @@
   "peerDependencies": {
     "@earendil-works/pi-agent-core": "*",
     "@earendil-works/pi-ai": "*",
-    "@earendil-works/pi-coding-agent": ">=0.83.0",
+    "@earendil-works/pi-coding-agent": ">=0.99.1",
     "@earendil-works/pi-tui": "*",
     "@mariozechner/pi-agent-core": "*",
     "@mariozechner/pi-ai": "*",
@@ -38,17 +38,17 @@
     ]
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "1.27.1",
     "ajv": "^8.20.0",
     "ajv-formats": "^3.0.1",
     "jiti": "2.7.0",
     "yaml": "^2.8.2"
   },
   "devDependencies": {
-    "@earendil-works/pi-agent-core": "0.83.0",
-    "@earendil-works/pi-ai": "0.83.0",
-    "@earendil-works/pi-coding-agent": "0.83.0",
-    "@earendil-works/pi-tui": "0.83.0",
+    "@earendil-works/pi-agent-core": "0.99.1",
+    "@earendil-works/pi-ai": "0.99.1",
+    "@earendil-works/pi-coding-agent": "0.99.1",
+    "@earendil-works/pi-tui": "0.99.1",
+    "@modelcontextprotocol/sdk": "1.27.1",
     "typescript": "^5.9.3",
     "vitest": "^4.1.10"
   }

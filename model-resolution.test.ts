@@ -773,7 +773,7 @@ describe("getSupportedThinkingLevelsCompat", () => {
 		},
 		{
 			id: "gpt-5.3-codex",
-			expected: ["off", "minimal", "low", "medium", "high", "xhigh"],
+			expected: ["off", "minimal", "low", "medium", "high"],
 		},
 	])("treats a null runtime map as the map-less fallback for $id", ({ id, expected }) => {
 		const levels = getSupportedThinkingLevelsCompat(
@@ -805,7 +805,7 @@ describe("getSupportedThinkingLevelsCompat", () => {
 	it.each([
 		{ id: "gpt-5.3-codex", api: "openai-responses" as Api },
 		{ id: "claude-opus-4.6", api: "anthropic-messages" as Api },
-	])("adds xhigh for a map-less public supportsXhigh model: $id", ({ id, api }) => {
+	])("uses native metadata rather than inferring xhigh from the model name: $id", ({ id, api }) => {
 		const levels = getSupportedThinkingLevelsCompat(
 			runtimeModel({ id, api, reasoning: true }),
 		);
@@ -816,7 +816,6 @@ describe("getSupportedThinkingLevelsCompat", () => {
 			"low",
 			"medium",
 			"high",
-			"xhigh",
 		]);
 		expect(levels).not.toContain("max");
 	});

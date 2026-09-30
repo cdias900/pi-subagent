@@ -1,7 +1,6 @@
-import * as piAi from "@mariozechner/pi-ai";
+import { getSupportedThinkingLevels } from "@earendil-works/pi-ai";
 import type { Api, Model } from "@mariozechner/pi-ai";
 import {
-	CANONICAL_THINKING_LEVELS,
 	normalizeModelString,
 	splitProviderModel,
 	type SubagentThinkingLevel,
@@ -187,58 +186,8 @@ export function validateResolvedModel(
 	return { ok: true, model };
 }
 
-// The pinned pi-ai 0.56.1 Model type does not declare thinkingLevelMap,
-// while newer Pi hosts provide it at runtime. Keep that version bridge narrow.
-interface RuntimeThinkingMeta {
-	reasoning?: boolean;
-	thinkingLevelMap?: Partial<Record<SubagentThinkingLevel, string | null>>;
-}
-
 export function getSupportedThinkingLevelsCompat(
 	model: Model<Api>,
 ): SubagentThinkingLevel[] {
-	const meta = model as unknown as RuntimeThinkingMeta;
-	if (!meta.reasoning) return ["off"];
-
-	const map = meta.thinkingLevelMap;
-	if (map != null) {
-		return CANONICAL_THINKING_LEVELS.filter((level) => {
-			const mapped = map[level];
-			if (mapped === null) return false;
-			if (level === "xhigh" || level === "max") {
-				return mapped !== undefined;
-			}
-			return true;
-		});
-	}
-
-	// Prefer the modern host API (`getSupportedThinkingLevels`) when present.
-	// pi 0.82.1's extension loader force-aliases `@mariozechner/pi-ai` to its
-	// bundled `@earendil-works/pi-ai/compat`, which removed `supportsXhigh`;
-	// a static named import becomes `undefined` at runtime and throws. The
-	// feature-detect below keeps the pinned 0.56.1 devDependency path working
-	// (it has no modern API) while never calling a missing legacy symbol.
-	const modern = (
-		piAi as unknown as {
-			getSupportedThinkingLevels?: (m: Model<Api>) => string[];
-		}
-	).getSupportedThinkingLevels;
-	if (typeof modern === "function") {
-		const levels = modern(model);
-		return CANONICAL_THINKING_LEVELS.filter((l) => levels.includes(l));
-	}
-
-	const levels: SubagentThinkingLevel[] = [
-		"off",
-		"minimal",
-		"low",
-		"medium",
-		"high",
-	];
-	// legacy fallback, guarded so a missing symbol can never throw
-	const legacy = (
-		piAi as unknown as { supportsXhigh?: (m: Model<Api>) => boolean }
-	).supportsXhigh;
-	if (typeof legacy === "function" && legacy(model)) levels.push("xhigh");
-	return levels;
+	return getSupportedThinkingLevels(model);
 }

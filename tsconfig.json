@@ -1,9 +1,17 @@
 {
 	"compilerOptions": {
 		"target": "ES2022",
-		"lib": ["ES2022"],
+		"lib": ["ES2023"],
 		"module": "ESNext",
 		"moduleResolution": "bundler",
+		"paths": {
+			"@mariozechner/pi-coding-agent": ["./node_modules/@earendil-works/pi-coding-agent/dist/index.d.ts"],
+			"@mariozechner/pi-agent-core": ["./node_modules/@earendil-works/pi-agent-core/dist/index.d.ts"],
+			"@mariozechner/pi-ai": ["./node_modules/@earendil-works/pi-ai/dist/compat.d.ts"],
+			"@mariozechner/pi-tui": ["./node_modules/@earendil-works/pi-tui/dist/index.d.ts"],
+			"@sinclair/typebox": ["./node_modules/typebox/build/index.d.mts"],
+			"@sinclair/typebox/*": ["./node_modules/typebox/build/*/index.d.mts"]
+		},
 		"strict": true,
 		"skipLibCheck": true,
 		"noEmit": true,
