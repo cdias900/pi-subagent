@@ -30,7 +30,7 @@ import { type AgentConfig, type AgentDiscoveryResult, type AgentScope, discoverA
 import { hasTerminalFailure, isSuccessfulResult } from "./result-status.js";
 import { registerAgentModelCommand } from "./agent-model-command.js";
 import { persistAgentModelFile } from "./agent-model-file.js";
-import { createSdkChild, type SdkChild } from "./sdk-runner.js";
+import { createSdkChild, resolveSdkProjectTrust, type SdkChild } from "./sdk-runner.js";
 import { loadScopedMcpServers } from "./sdk-mcp.js";
 import { AgentsPanel, type PanelAgent, type TranscriptEntry } from "./agents-panel.js";
 import { registerCoordinationTools } from "./coordination.js";
@@ -160,37 +160,6 @@ function resolveExtensionPaths(agentDir: string, requested: string[]): string[] 
 		resolved.push(extPath);
 	}
 	return resolved;
-}
-
-/**
- * Find the mcp-bridge extension's index.ts — checks installed packages (git/) and extensions dir.
- */
-function findMcpBridgePath(agentDir: string): string | null {
-	const candidates = [
-		// Installed via pi install (git package)
-		path.join(agentDir, "git", "github.com", "cdias900", "pi-mcp-bridge", "index.ts"),
-		// Local extension (auto-discovered)
-		path.join(agentDir, "extensions", "mcp-bridge", "index.ts"),
-	];
-
-	// Also check for any pi-mcp-bridge package in the git dir (different usernames)
-	try {
-		const gitDir = path.join(agentDir, "git", "github.com");
-		if (fs.existsSync(gitDir)) {
-			for (const user of fs.readdirSync(gitDir)) {
-				const candidate = path.join(gitDir, user, "pi-mcp-bridge", "index.ts");
-				if (!candidates.includes(candidate)) candidates.push(candidate);
-			}
-		}
-	} catch {
-		/* ignore */
-	}
-
-	for (const candidate of candidates) {
-		if (fs.existsSync(candidate)) return candidate;
-	}
-
-	return null;
 }
 
 function readPositiveIntEnv(name: string, fallback: number): number {
@@ -634,9 +603,10 @@ function makeCatalogPort(
 export function preflightValidateInvocations(
 	invocations: readonly AgentInvocation[],
 	port: ModelCatalogPort,
+	defaultCwd = process.cwd(),
 ): void {
 	for (const invocation of invocations) {
-		childResources(invocation.agent, invocation.extensions, invocation.mcps);
+		childResources(invocation.agent, invocation.extensions, invocation.mcps, invocation.cwd ?? defaultCwd);
 		const result = validateResolvedModel(invocation.resolvedModel, port, {
 			agentName: invocation.agentName,
 		});
@@ -854,11 +824,11 @@ export function resolveScopeDiscovery(
 
 type OnUpdateCallback = (partial: AgentToolResult<SubagentDetails>) => void;
 
-function childResources(agent: AgentConfig, extensions?: string[], mcps?: string[]) {
+function childResources(agent: AgentConfig, extensions?: string[], mcps?: string[], cwd = process.cwd()) {
 	const agentDir = getAgentDir();
 	return {
 		extensionPaths: resolveExtensionPaths(agentDir, [...new Set([...(agent.extensions ?? []), ...(extensions ?? [])])]),
-		...(mcps?.length ? { mcpServers: loadScopedMcpServers(mcps, agentDir), mcpBridgePath: findMcpBridgePath(agentDir) ?? undefined } : {}),
+		...(mcps?.length ? { mcpServers: loadScopedMcpServers(mcps, agentDir, cwd, resolveSdkProjectTrust(cwd, agentDir)) } : {}),
 	};
 }
 
@@ -908,7 +878,7 @@ async function runSingleAgent(
 			cwd: invocation.cwd ?? defaultCwd,
 			agent: invocation.agent,
 			resolvedModel: invocation.resolvedModel,
-			...childResources(invocation.agent, invocation.extensions, invocation.mcps),
+			...childResources(invocation.agent, invocation.extensions, invocation.mcps, invocation.cwd ?? defaultCwd),
 			onEvent(event) {
 				const handle = foregroundAgents.get(runId);
 				if (handle) handle.lastEventAt = Date.now();
@@ -1116,7 +1086,7 @@ function launchBackgroundAgent(bgAgent: BackgroundAgent): void {
 			modelSource: bgAgent.result.configSource ?? "parent",
 			source: bgAgent.result.configSource ?? "parent",
 		},
-		...childResources(bgAgent.agentConfig, bgAgent.extensions, bgAgent.mcps),
+		...childResources(bgAgent.agentConfig, bgAgent.extensions, bgAgent.mcps, bgAgent.cwd),
 		backgroundInstruction: BG_SIGNAL_INSTRUCTION,
 		onEvent(event) {
 			bgAgent.lastEventAt = Date.now();
@@ -2170,7 +2140,7 @@ export default function (
 						modelResolution: modelResolutionFor(t.agent),
 					}),
 				);
-				preflightValidateInvocations(invocations, catalogPort);
+				preflightValidateInvocations(invocations, catalogPort, ctx.cwd);
 				const { groupId, memberIds, queuedCount } = launchBackgroundParallel(
 					{ tasks: params.tasks!, saveAs: params.saveAs, notifyPerTask: params.notifyPerTask },
 					ctx.cwd, teamName,
@@ -2202,7 +2172,7 @@ export default function (
 						modelResolution: modelResolutionFor(step.agent),
 					}),
 				);
-				preflightValidateInvocations(preflightInvocations, catalogPort);
+				preflightValidateInvocations(preflightInvocations, catalogPort, ctx.cwd);
 				const stepResolvedModels = preflightInvocations.map(
 					(invocation) => invocation.resolvedModel,
 				);
@@ -2243,7 +2213,7 @@ export default function (
 						modelResolution: modelResolutionFor(step.agent),
 					}),
 				);
-				preflightValidateInvocations(preflightInvocations, catalogPort);
+				preflightValidateInvocations(preflightInvocations, catalogPort, ctx.cwd);
 
 				const results: SingleResult[] = [];
 				let previousOutput: string | undefined = undefined;
@@ -2313,7 +2283,7 @@ export default function (
 					teamName,
 					modelResolution: modelResolutionFor(t.agent),
 				}));
-				preflightValidateInvocations(invocations, catalogPort);
+				preflightValidateInvocations(invocations, catalogPort, ctx.cwd);
 
 				// Initialize placeholder results
 				for (let i = 0; i < params.tasks.length; i++) {
@@ -2421,7 +2391,7 @@ export default function (
 					teamName,
 					modelResolution: modelResolutionFor(params.agent),
 				});
-				preflightValidateInvocations([invocation], catalogPort);
+				preflightValidateInvocations([invocation], catalogPort, ctx.cwd);
 
 				// ── Background mode ──
 				if (params.background) {

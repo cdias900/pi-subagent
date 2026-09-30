@@ -217,7 +217,7 @@ These tools are compatible with [Claude Code's agent team system](https://code.c
 
 ### MCP Scoping for Subagents
 
-Control which MCP servers a subagent can access (requires [pi-mcp-bridge](https://github.com/cdias900/pi-mcp-bridge)):
+Control which MCP servers a subagent can access. Servers are selected from native Pi configuration: `~/.pi/agent/mcp.json` (or the configured agent directory) and the trusted child's `.pi/mcp.json`, both using `{ "mcpServers": { ... } }`. Project entries replace global entries with the same name; no bridge extension is required.
 
 ```
 subagent({
@@ -542,7 +542,7 @@ pi-subagent/
 ## Compatibility
 
 - **Pi 0.83.0 or later is required.** The extension uses only the host's `@earendil-works/pi-coding-agent` SDK. Backend environment switches are no longer read; rollback requires restoring a prior extension revision.
-- Scoped MCP keeps the `mcp__server__tool` names and stored bridge OAuth credentials. If an MCP server needs a new interactive login, authenticate it in the parent session first; unattended children do not open an OAuth browser flow.
+- Scoped MCP keeps the `mcp__server__tool` names and session-local HTTP/stdio clients for compatibility with Pi SDK 0.83. Servers may omit `type` (inferred from `command` or `url`); `streamable-http` is accepted, and disabled servers cannot be selected. Stdio defaults to the child's cwd, with a configured relative `cwd` resolved against it. Scoped children expose tools directly (also when `exposure` is omitted); retain `exposure: "direct"` for scoped servers. Selected entries with headers, OAuth settings, non-direct exposure, `toolExposure`, native timeout settings, env secret expansion (`${NAME}` / `!command`), or `~/` paths fail explicitly rather than being silently ignored. This is not the native MCP runtime: native OAuth credentials, resources, and reconnection are not implemented here. OAuth-only servers cannot currently be used by scoped children, even after parent login. The old bridge config and credential store are not read.
 - **`/agent-model global` now edits user-agent frontmatter.** It no longer writes ordinary selections to `subagent-models.json`. Existing legacy JSON entries are still read and must be migrated or removed before changing the same agent's frontmatter.
 - **Invocation model overrides remain enabled by default.** Existing callers keep the current `model` and `thinkingLevel` fields unless `allowInvocationModelOverrides` is set to `false` in `~/.pi/agent/subagent-settings.json`.
 - **`tools: []` semantics (intentional change):** earlier pi-subagent versions

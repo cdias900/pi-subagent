@@ -4,7 +4,8 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { createRequire } from "node:module";
 import { pathToFileURL } from "node:url";
-import { createSdkChild } from "./sdk-runner.js";
+import { ProjectTrustStore } from "@earendil-works/pi-coding-agent";
+import { createSdkChild, resolveSdkProjectTrust } from "./sdk-runner.js";
 import { loadScopedMcpServers } from "./sdk-mcp.js";
 import { offlineSdkFixture } from "./test/offline-sdk.js";
 import type { AgentConfig } from "./agents.js";
@@ -18,9 +19,72 @@ afterEach(async () => { await fixture.dispose(); });
 
 describe("session-scoped MCP in the SDK", () => {
 	it("selects only configured server names without writing global environment", () => {
-		writeFileSync(join(fixture.root, "mcp.json"), JSON.stringify({ alpha: { type: "http", url: "http://127.0.0.1:1" }, beta: { type: "http", url: "http://127.0.0.1:2" } }));
-		expect(Object.keys(loadScopedMcpServers(["alpha"], fixture.agentDir))).toEqual(["alpha"]);
+		writeFileSync(join(fixture.agentDir, "mcp.json"), JSON.stringify({ mcpServers: {
+			alpha: { url: "http://127.0.0.1:1", exposure: "direct" },
+			beta: { type: "streamable-http", url: "http://127.0.0.1:2" },
+			local: { command: process.execPath, args: ["-v"], env: { FIXTURE: "value" } },
+		} }));
+		expect(Object.keys(loadScopedMcpServers(["alpha", "alpha"], fixture.agentDir))).toEqual(["alpha"]);
+		expect(loadScopedMcpServers(["alpha", "beta", "local"], fixture.agentDir)).toMatchObject({
+			alpha: { type: "http" }, beta: { type: "http" }, local: { type: "stdio", env: { FIXTURE: "value" } },
+		});
 		expect(() => loadScopedMcpServers(["unknown"], fixture.agentDir)).toThrow("is not configured");
+	});
+
+	it("uses only native wrapped config, never the old bridge file", () => {
+		writeFileSync(join(fixture.root, "mcp.json"), JSON.stringify({ alpha: { type: "http", url: "http://127.0.0.1:1" } }));
+		expect(loadScopedMcpServers([], fixture.agentDir)).toEqual({});
+		expect(() => loadScopedMcpServers(["alpha"], fixture.agentDir)).toThrow("is not configured");
+		writeFileSync(join(fixture.agentDir, "mcp.json"), JSON.stringify({ alpha: { type: "http", url: "http://127.0.0.1:1" } }));
+		expect(() => loadScopedMcpServers(["alpha"], fixture.agentDir)).toThrow("expected an mcpServers object");
+	});
+
+	it("merges only the trusted child's project config, with project entries replacing global ones", () => {
+		writeFileSync(join(fixture.agentDir, "mcp.json"), JSON.stringify({ mcpServers: { alpha: { url: "http://127.0.0.1:1" } } }));
+		mkdirSync(join(fixture.cwd, ".pi"));
+		writeFileSync(join(fixture.cwd, ".pi", "mcp.json"), JSON.stringify({ mcpServers: { alpha: { command: "project-command" }, quick: { command: "quick-command" } } }));
+		expect(resolveSdkProjectTrust(fixture.cwd, fixture.agentDir)).toBe(false);
+		expect(loadScopedMcpServers(["alpha"], fixture.agentDir, fixture.cwd, false).alpha.type).toBe("http");
+		expect(() => loadScopedMcpServers(["quick"], fixture.agentDir, fixture.cwd, false)).toThrow("is not configured");
+		new ProjectTrustStore(fixture.agentDir).set(fixture.cwd, true);
+		expect(resolveSdkProjectTrust(fixture.cwd, fixture.agentDir)).toBe(true);
+		expect(loadScopedMcpServers(["alpha"], fixture.agentDir, fixture.cwd, true)).toEqual({ alpha: { type: "stdio", command: "project-command" } });
+		const otherCwd = join(fixture.root, "other-project"); mkdirSync(otherCwd);
+		expect(loadScopedMcpServers(["alpha"], fixture.agentDir, otherCwd, true).alpha.type).toBe("http");
+	});
+
+	it("rejects selected disabled or invalid entries without loading unselected ones", () => {
+		const configPath = join(fixture.agentDir, "mcp.json");
+		writeFileSync(configPath, JSON.stringify({ mcpServers: {
+			alpha: { url: "http://127.0.0.1:1" }, disabled: { command: "ignored", enabled: false },
+			invalid: {}, sse: { type: "sse", url: "http://127.0.0.1:1" },
+		} }));
+		expect(Object.keys(loadScopedMcpServers(["alpha"], fixture.agentDir))).toEqual(["alpha"]);
+		expect(() => loadScopedMcpServers(["disabled"], fixture.agentDir)).toThrow("is disabled");
+		expect(() => loadScopedMcpServers(["invalid"], fixture.agentDir)).toThrow("Invalid MCP server");
+		expect(() => loadScopedMcpServers(["sse"], fixture.agentDir)).toThrow("Invalid MCP server");
+		writeFileSync(configPath, "{");
+		expect(() => loadScopedMcpServers(["alpha"], fixture.agentDir)).toThrow();
+	});
+
+	it.each([
+		["headers", { headers: { Authorization: "Bearer token" } }],
+		["oauth", { oauth: { clientId: "fixture" } }],
+		["exposure", { exposure: "hidden" }],
+		["exposure", { exposure: "codemode" }],
+		["exposure", { exposure: "deferred" }],
+		["toolExposure", { toolExposure: { ping: "hidden" } }],
+		["timeout", { timeout: 10 }],
+		["env secret expansion", { env: { KEY: "${FIXTURE_KEY}" } }],
+		["env secret expansion", { env: { KEY: "!echo secret" } }],
+		["~/ expansion", { args: ["~/server.js"] }],
+	])("rejects unsupported selected config: %s", (message, extra) => {
+		writeFileSync(join(fixture.agentDir, "mcp.json"), JSON.stringify({ mcpServers: {
+			alpha: { command: process.execPath, exposure: "direct" },
+			unsupported: { command: process.execPath, exposure: "direct", ...extra },
+		} }));
+		expect(Object.keys(loadScopedMcpServers(["alpha"], fixture.agentDir))).toEqual(["alpha"]);
+		expect(() => loadScopedMcpServers(["unsupported"], fixture.agentDir)).toThrow(`does not support ${message}`);
 	});
 
 	it("discovers and calls an HTTP MCP tool from two independent SDK sessions", async () => {
@@ -43,9 +107,13 @@ describe("session-scoped MCP in the SDK", () => {
 		await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
 		const address = server.address(); if (!address || typeof address === "string") throw new Error("Expected TCP port");
 		const before = process.env.PI_MCP_CONFIG;
+		writeFileSync(join(fixture.agentDir, "mcp.json"), JSON.stringify({ mcpServers: {
+			alpha: { url: `http://127.0.0.1:${address.port}/mcp`, exposure: "direct" },
+			unselected: { url: "http://127.0.0.1:1/mcp", exposure: "direct" },
+		} }));
 		const children = await Promise.all([1, 2].map(() => createSdkChild({
 			cwd: fixture.cwd, agent, resolvedModel: model, onEvent() {},
-			mcpServers: { alpha: { type: "http", url: `http://127.0.0.1:${address.port}/mcp` } },
+			mcpServers: loadScopedMcpServers(["alpha"], fixture.agentDir),
 		})));
 		try {
 			await Promise.all(children.map((child) => child.prompt("mcp-fixture")));
@@ -61,30 +129,18 @@ describe("session-scoped MCP in the SDK", () => {
 		}
 	}, 15000);
 
-	it("does not connect after cancellation during an OAuth-module import", async () => {
-		const bridgeDir = join(fixture.root, "bridge"); mkdirSync(bridgeDir);
-		const marker = join(fixture.root, "oauth-import-started");
-		writeFileSync(join(bridgeDir, "oauth.ts"), `
-import { writeFileSync } from 'node:fs';
-writeFileSync(${JSON.stringify(marker)}, 'started');
-await new Promise(resolve => setTimeout(resolve, 100));
-export class BridgeOAuthProvider {}
-`);
+	it("does not connect an HTTP server when setup is already cancelled", async () => {
 		let requests = 0;
 		const server = createServer((_req, res) => { requests++; res.writeHead(400); res.end(); });
 		await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
 		const address = server.address(); if (!address || typeof address === "string") throw new Error("Expected TCP port");
-		const controller = new AbortController();
+		const controller = new AbortController(); controller.abort();
 		try {
 			const pending = createSdkChild({
 				cwd: fixture.cwd, agent, resolvedModel: model, signal: controller.signal, onEvent() {},
-				mcpBridgePath: join(bridgeDir, "index.ts"),
 				mcpServers: { alpha: { type: "http", url: `http://127.0.0.1:${address.port}` } },
 			});
 			const result = pending.then(() => "unexpected success", (error: Error) => error.message);
-			const deadline = Date.now() + 3000;
-			while (!existsSync(marker) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10));
-			expect(existsSync(marker)).toBe(true); controller.abort();
 			expect(await result).not.toBe("unexpected success");
 			expect(requests).toBe(0);
 		} finally { server.closeAllConnections(); await new Promise<void>((resolve) => server.close(() => resolve())); }
@@ -120,10 +176,24 @@ server.setRequestHandler(ListToolsRequestSchema, () => ({tools: [{name: "ping", 
 server.setRequestHandler(CallToolRequestSchema, () => ({content: [{type: "text", text: process.cwd()}]}));
 await server.connect(new StdioServerTransport());
 `);
-		const child = await createSdkChild({ cwd: fixture.cwd, agent, resolvedModel: model, onEvent() {}, mcpServers: { alpha: { type: "stdio", command: process.execPath, args: [script] } } });
+		mkdirSync(join(fixture.cwd, ".pi"));
+		writeFileSync(join(fixture.cwd, ".pi", "mcp.json"), JSON.stringify({ mcpServers: {
+			alpha: { command: process.execPath, args: [script], exposure: "direct" },
+		} }));
+		new ProjectTrustStore(fixture.agentDir).set(fixture.cwd, true);
+		fixture.agent("tools: [mcp__alpha__ping]\n", "mcp");
+		// Go through subagent preflight and foreground dispatch, not just the SDK helper.
+		const result = await fixture.invoke("subagent", { agent: "mcp", task: "mcp-fixture", mcps: ["alpha"] });
+		expect(result.details.results[0].exitCode).toBe(0);
+		expect(JSON.stringify(result.details.results[0].messages)).toContain(fixture.cwd);
+
+		const configuredCwd = join(fixture.cwd, "server-workdir"); mkdirSync(configuredCwd);
+		const child = await createSdkChild({ cwd: fixture.cwd, agent, resolvedModel: model, onEvent() {},
+			mcpServers: { alpha: { type: "stdio", command: process.execPath, args: [script], cwd: "server-workdir" } },
+		});
 		try {
 			await child.prompt("mcp-fixture");
-			expect(JSON.stringify(child.session.messages)).toContain("/project");
+			expect(JSON.stringify(child.session.messages)).toContain(configuredCwd);
 		} finally { await child.dispose(); }
 	}, 15000);
 });

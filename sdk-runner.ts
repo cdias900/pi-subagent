@@ -14,6 +14,8 @@ import {
 	type AgentSessionRuntime,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import { existsSync } from "node:fs";
+import { join } from "node:path";
 import type { AgentConfig } from "./agents.js";
 import type { ResolvedModelConfig } from "./model-resolution.js";
 import { loadChildExtensions } from "./sdk-extensions.js";
@@ -36,7 +38,8 @@ export interface SdkChild {
 
 /** Match the non-interactive CLI child's saved/default project-trust decision. */
 export function resolveSdkProjectTrust(cwd: string, agentDir = getAgentDir()): boolean {
-	if (!hasTrustRequiringProjectResources(cwd)) return true;
+	// Pi 0.83 predates native MCP and does not include mcp.json in its trust gate.
+	if (!hasTrustRequiringProjectResources(cwd) && !existsSync(join(cwd, ".pi", "mcp.json"))) return true;
 	const saved = new ProjectTrustStore(agentDir).get(cwd);
 	if (saved !== null) return saved;
 	return SettingsManager.create(cwd, agentDir, { projectTrusted: false }).getDefaultProjectTrust() === "always";
@@ -50,7 +53,6 @@ export async function createSdkChild(options: {
 	resolvedModel: ResolvedModelConfig;
 	extensionPaths?: string[];
 	mcpServers?: Record<string, ScopedMcpServer>;
-	mcpBridgePath?: string;
 	backgroundInstruction?: string;
 	onEvent: (event: AgentSessionEvent) => void;
 }): Promise<SdkChild> {
@@ -99,7 +101,7 @@ export async function createSdkChild(options: {
 	const extensions = await loadChildExtensions(extensionPaths, cwd);
 	checkAbort();
 	const mcp = options.mcpServers && Object.keys(options.mcpServers).length > 0
-		? createScopedMcpExtension({ servers: options.mcpServers, cwd, bridgePath: options.mcpBridgePath, signal: options.signal })
+		? createScopedMcpExtension({ servers: options.mcpServers, cwd, signal: options.signal })
 		: undefined;
 	const models = await createChildModelRuntime(cwd, agentDir, options.signal);
 	let runtime: AgentSessionRuntime;

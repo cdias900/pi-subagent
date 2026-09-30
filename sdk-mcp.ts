@@ -1,13 +1,11 @@
-import { readFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { existsSync, readFileSync } from "node:fs";
+import { join, resolve } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { StreamableHTTPClientTransport, StreamableHTTPError } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
-import type { OAuthClientProvider } from "@modelcontextprotocol/sdk/client/auth.js";
 import { getAgentDir, truncateHead, type ExtensionFactory } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { createChildModuleLoader } from "./sdk-extensions.js";
 import { version } from "./package.json";
 
 export interface ScopedMcpServer {
@@ -15,19 +13,57 @@ export interface ScopedMcpServer {
 	command?: string;
 	args?: string[];
 	env?: Record<string, string>;
+	cwd?: string;
 	url?: string;
 }
 
-/** Same global source and name selection as the former per-run scoped file. */
-export function loadScopedMcpServers(names: readonly string[], agentDir = getAgentDir()): Record<string, ScopedMcpServer> {
-	const configPath = join(dirname(agentDir), "mcp.json");
-	const config = JSON.parse(readFileSync(configPath, "utf8"));
-	return Object.fromEntries([...new Set(names)].map((name) => {
-		const server = config[name];
-		if (!server || !["stdio", "http", "sse"].includes(server.type)) {
-			throw new Error(`MCP server "${name}" is not configured in ${configPath}`);
+/** Read only native config files; trusted project entries replace global entries. */
+export function loadScopedMcpServers(
+	names: readonly string[],
+	agentDir = getAgentDir(),
+	cwd = process.cwd(),
+	projectTrusted = false,
+): Record<string, ScopedMcpServer> {
+	if (names.length === 0) return {};
+	const configPaths = [join(agentDir, "mcp.json"), ...(projectTrusted ? [join(cwd, ".pi", "mcp.json")] : [])];
+	const servers = new Map<string, { server: Record<string, unknown>; source: string }>();
+	for (const source of configPaths) {
+		if (!existsSync(source)) continue;
+		const config = JSON.parse(readFileSync(source, "utf8"));
+		if (!config?.mcpServers || typeof config.mcpServers !== "object" || Array.isArray(config.mcpServers)) {
+			throw new Error(`Invalid MCP config ${source}: expected an mcpServers object`);
 		}
-		return [name, server as ScopedMcpServer];
+		for (const [name, server] of Object.entries(config.mcpServers)) {
+			servers.set(name, { server: server as Record<string, unknown>, source });
+		}
+	}
+	return Object.fromEntries([...new Set(names)].map((name) => {
+		const entry = servers.get(name);
+		if (!entry) throw new Error(`MCP server "${name}" is not configured in ${configPaths.join(" or ")}`);
+		const { server, source } = entry;
+		if (!server || typeof server !== "object" || Array.isArray(server)) throw new Error(`Invalid MCP server "${name}" in ${source}`);
+		if (server.enabled === false) throw new Error(`MCP server "${name}" is disabled in ${source}`);
+		// These clients deliberately are not Pi's native runtime. Fail closed rather
+		// than ignore authentication or expose tools intended to be hidden/deferred.
+		const unsupported = ["headers", "oauth", "toolExposure", "timeout"].find((key) => server[key] !== undefined)
+			?? (server.exposure !== undefined && server.exposure !== "direct" ? "exposure (only direct is supported)" : undefined);
+		if (unsupported) throw new Error(`Scoped MCP server "${name}" in ${source} does not support ${unsupported}`);
+		const envValues = server.env && typeof server.env === "object" ? Object.values(server.env) : [];
+		if (envValues.some((value) => typeof value === "string" && (value.includes("${") || value.startsWith("!")))) {
+			throw new Error(`Scoped MCP server "${name}" in ${source} does not support env secret expansion`);
+		}
+		const paths = [server.command, server.cwd, ...(Array.isArray(server.args) ? server.args : [])];
+		if (paths.some((value) => typeof value === "string" && value.startsWith("~/"))) {
+			throw new Error(`Scoped MCP server "${name}" in ${source} does not support ~/ expansion`);
+		}
+		const type = server.type ?? (server.command ? "stdio" : server.url ? "http" : undefined);
+		const normalizedType = type === "streamable-http" ? "http" : type;
+		if (!/^[a-zA-Z0-9_-]+$/.test(name) ||
+			!(normalizedType === "stdio" && typeof server.command === "string" && server.command.trim() ||
+			  normalizedType === "http" && typeof server.url === "string" && server.url.trim())) {
+			throw new Error(`Invalid MCP server "${name}" in ${source}: expected stdio command or HTTP url`);
+		}
+		return [name, { ...server, type: normalizedType } as unknown as ScopedMcpServer];
 	}));
 }
 
@@ -39,7 +75,6 @@ function textContent(value: string) {
 export function createScopedMcpExtension(options: {
 	servers: Record<string, ScopedMcpServer>;
 	cwd: string;
-	bridgePath?: string;
 	signal?: AbortSignal;
 }) {
 	const clients = new Map<string, Client>();
@@ -59,19 +94,6 @@ export function createScopedMcpExtension(options: {
 			initialization = (async () => {
 				for (const [name, server] of Object.entries(options.servers)) {
 					if (closed) throw new Error("MCP setup was aborted");
-					let authProvider: OAuthClientProvider | undefined;
-					if (options.bridgePath && server.type === "http") {
-						// Reuse the bridge's maintained credential store and OAuth refresh
-						// behavior; do not initialize another global bridge extension.
-						const oauth = await createChildModuleLoader().import<{
-							BridgeOAuthProvider: new (name: string, port: number) => OAuthClientProvider;
-						}>(join(dirname(options.bridgePath), "oauth.ts"));
-						if (closed) throw new Error("MCP setup was aborted");
-						authProvider = new oauth.BridgeOAuthProvider(name, 19876);
-						authProvider.redirectToAuthorization = () => {
-							throw new Error(`MCP server "${name}" needs login; authenticate it in the parent Pi session first`);
-						};
-					}
 					const connect = async (legacySse = false) => {
 						if (closed) throw new Error("MCP setup was aborted");
 						const client = new Client({ name: `pi-subagent-${name}`, version });
@@ -80,11 +102,11 @@ export function createScopedMcpExtension(options: {
 							? new StdioClientTransport({
 								command: server.command ?? "", args: server.args,
 								env: { ...Object.fromEntries(Object.entries(process.env).filter((entry): entry is [string, string] => entry[1] !== undefined)), ...server.env },
-								cwd: options.cwd, stderr: "pipe",
+								cwd: server.cwd ? resolve(options.cwd, server.cwd) : options.cwd, stderr: "pipe",
 							})
 							: server.type === "sse" || legacySse
-								? new SSEClientTransport(new URL(server.url ?? ""), { authProvider })
-								: new StreamableHTTPClientTransport(new URL(server.url ?? ""), { authProvider });
+								? new SSEClientTransport(new URL(server.url ?? ""))
+								: new StreamableHTTPClientTransport(new URL(server.url ?? ""));
 						try {
 							await client.connect(transport);
 							if (closed) throw new Error("MCP setup was aborted");
