@@ -22,6 +22,7 @@ export interface AgentConfig {
 	description: string;
 	tools?: string[];
 	extensions?: string[];
+	mcps?: string[];
 	model?: string;
 	systemPrompt: string;
 	source: "bundled" | "user" | "project";
@@ -104,6 +105,7 @@ export function loadAgentsFromDir(dir: string, source: AgentConfig["source"], di
 
 			const tools = asStringList(frontmatter.tools);
 			const extensions = asStringList(frontmatter.extensions);
+			const mcps = asStringList(frontmatter.mcps);
 
 			const systemPromptMode = asString(frontmatter.systemPromptMode);
 			if (
@@ -122,6 +124,7 @@ export function loadAgentsFromDir(dir: string, source: AgentConfig["source"], di
 				description,
 				tools,
 				extensions: extensions && extensions.length > 0 ? extensions : undefined,
+				mcps: mcps && mcps.length > 0 ? mcps : undefined,
 				model: asString(frontmatter.model),
 				systemPrompt: body,
 				source,

@@ -106,6 +106,16 @@ describe("loadAgentsFromDir — new frontmatter fields", () => {
 		expect(agent.noContextFiles).toBe(true);
 	});
 
+	it("parses frontmatter mcps and treats an empty list as omitted", () => {
+		writeAgent(dir, "mcp-agent", { name: "mcp-agent", description: "Uses MCP", mcps: ["tool-gateway", "qmd"] });
+		writeAgent(dir, "no-mcp-agent", { name: "no-mcp-agent", description: "Empty MCP list", mcps: [] });
+		const { agents, diagnostics } = loadDir(dir);
+		expect(diagnostics).toEqual([]);
+		const byName = Object.fromEntries(agents.map((agent) => [agent.name, agent]));
+		expect(byName["mcp-agent"].mcps).toEqual(["tool-gateway", "qmd"]);
+		expect(byName["no-mcp-agent"].mcps).toBeUndefined();
+	});
+
 	it("systemPromptMode 'append' is valid", () => {
 		writeAgent(dir, "append-agent", {
 			name: "append-agent",

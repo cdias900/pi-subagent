@@ -826,9 +826,10 @@ type OnUpdateCallback = (partial: AgentToolResult<SubagentDetails>) => void;
 
 function childResources(agent: AgentConfig, extensions?: string[], mcps?: string[], cwd = process.cwd()) {
 	const agentDir = getAgentDir();
+	const servers = [...new Set([...(agent.mcps ?? []), ...(mcps ?? [])])];
 	return {
 		extensionPaths: resolveExtensionPaths(agentDir, [...new Set([...(agent.extensions ?? []), ...(extensions ?? [])])]),
-		...(mcps?.length ? { mcpServers: loadScopedMcpServers(mcps, agentDir, cwd, resolveSdkProjectTrust(cwd, agentDir)) } : {}),
+		...(servers.length ? { mcpServers: loadScopedMcpServers(servers, agentDir, cwd, resolveSdkProjectTrust(cwd, agentDir)) } : {}),
 	};
 }
 

@@ -73,6 +73,7 @@ noPromptTemplates: false
 noContextFiles: false
 ---
 ```
+- `mcps`: MCP server names the agent always needs, merged with any `mcps` passed at invocation. See [MCP Scoping for Subagents](#mcp-scoping-for-subagents). Tools from a `codemode`-exposed server are reached through the `codemode` tool, so an agent with a non-empty `tools` list must include `codemode`.
 - `parameters`: Object JSON Schema for the `input` field (top-level `type: object` is required). This is the **existing schema-only input gate**: when present, the agent is parameterized and validates `input` against the schema before starting a child.
 - `inputInstructions`: Optional guidance injected into the agent's prompt.
 - `allowFreeform`: If `false`, the agent strictly requires `input` and rejects `task` (defaults to `true` if no parameters).
